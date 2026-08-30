@@ -1,0 +1,56 @@
+id: excel-browser-price-check
+title: Excel + Browser Price Check
+description: Learners open a pre-filled Excel spreadsheet with 10 products, search
+  each product in a browser, and enter the found price. They are then asked to reflect
+  on their workflow metrics.
+instructions: "1. Open the provided Excel file containing 10 product names in column\
+  \ A (rows 2\u201311), with column B empty for prices.\n2. For each product:\n  \
+  \ - Search for the product in your default browser.\n   - Find a plausible retail\
+  \ price.\n   - Switch back to Excel and enter the price in column B next to the\
+  \ product.\n3. After completing all entries, answer the following questions:\n \
+  \  - How many products did you search for?\n   - How many times did you switch between\
+  \ Excel and the browser?\n   - How many prices did you enter?\n   - How many times\
+  \ did you revisit the same website (same domain)?"
+environment:
+  type: gui
+difficulty: intermediate
+expected_outcomes:
+- id: products_searched_count
+  description: Learner correctly reports searching for all 10 products
+  type: observed_behavior
+  weight: 25.0
+  check: null
+- id: switches_count
+  description: "Learner provides a reasonable estimate of Excel\u2194browser switches\
+    \ (\u226510 expected)"
+  type: observed_behavior
+  weight: 25.0
+  check: null
+- id: prices_entered_count
+  description: Learner correctly reports entering 10 prices
+  type: observed_behavior
+  weight: 25.0
+  check: null
+- id: revisits_count
+  description: Learner correctly identifies revisits to same domain (e.g., multiple
+    Amazon tabs = revisits)
+  type: observed_behavior
+  weight: 25.0
+  check: null
+steps: null
+acceptable_methods:
+- Manual search and entry
+- Using multiple browser tabs/windows
+- Copying/pasting product names from Excel to browser search bar
+prohibited_behaviors:
+- Faking or fabricating answers without performing the task
+- Using automated scripts or bots to fill prices
+- Entering placeholder or random prices without searching
+mentor:
+  allow_questions: true
+  default_help_level: 2
+  reveal_answer: false
+signing_key: 5a1534baf7a4757ba2815e7e4a990b78
+author: null
+created_at: '2026-08-28T01:03:46.109187Z'
+sources: []

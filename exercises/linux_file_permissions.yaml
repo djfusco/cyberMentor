@@ -1,0 +1,53 @@
+id: linux-file-permissions-001
+
+title: Secure a File with Linux Permissions
+
+description: >
+  Practice creating directories and files and applying appropriate
+  filesystem permissions.
+
+instructions: |
+  Using Terminal:
+
+  1. Create a directory named secure-data in your home directory.
+  2. Create a file named secrets.txt inside secure-data.
+  3. Configure secrets.txt so that only the owner can read and write it.
+  4. Verify the permissions before finishing the exercise.
+
+environment:
+  type: terminal
+
+expected_outcomes:
+  - id: directory_created
+    description: ~/secure-data exists
+    type: filesystem
+    weight: 20
+
+  - id: file_created
+    description: ~/secure-data/secrets.txt exists
+    type: filesystem
+    weight: 20
+
+  - id: permissions_correct
+    description: ~/secure-data/secrets.txt has mode 600
+    type: filesystem
+    weight: 40
+
+  - id: permissions_verified
+    description: Student made a reasonable attempt to verify permissions
+    type: observed_behavior
+    weight: 20
+
+acceptable_methods:
+  - Student may cd into secure-data before creating the file.
+  - Student may use relative paths.
+  - Student may use absolute paths.
+  - Student may use any valid shell commands that produce the correct result.
+
+prohibited_behaviors:
+  - Setting the file permissions to 777 should not count as correct.
+
+mentor:
+  allow_questions: true
+  default_help_level: 2
+  reveal_answer: false

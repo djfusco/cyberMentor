@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AI Exercise Mentor</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>AI Exercise Mentor</h1>
+    {% include "_nav.html" %}
+    <div id="status-bar" class="status-bar">Checking services...</div>
+  </header>
+  <main class="container">
+    <details class="instructions-box">
+      <summary>Import an Exercise</summary>
+      <p class="muted">Received a .yaml file from an instructor? Add it here to make it available below.</p>
+      <form id="import-exercise-form">
+        <input type="file" id="import-exercise-file" accept=".yaml,.yml" required>
+        <button type="submit" class="button">Import</button>
+      </form>
+      <p id="import-exercise-status" class="muted"></p>
+    </details>
+
+    <h2>Available Exercises</h2>
+    {% if exercises %}
+    <ul class="exercise-list">
+      {% for exercise in exercises %}
+      <li class="exercise-card">
+        <h3>{{ exercise.title }}</h3>
+        <p>{{ exercise.description }}</p>
+        <span class="tag">{{ exercise.environment.type.value }}</span>
+        <p>Difficulty: {{ exercise.difficulty.value.capitalize() }}</p>
+        <a class="button" href="/exercises/{{ exercise.id }}">View &amp; Start</a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p>No exercises found. Add a YAML file to the <code>exercises/</code> directory.</p>
+    {% endif %}
+  </main>
+  <script src="/static/app.js"></script>
+  <script>
+    refreshStatus();
+    initImportExercisePage();
+  </script>
+</body>
+</html>

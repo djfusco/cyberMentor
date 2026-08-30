@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Results - {{ exercise.title }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-session-id="{{ session.id }}">
+  <header class="topbar">
+    <h1><a href="/">AI Exercise Mentor</a></h1>
+    {% include "_nav.html" %}
+  </header>
+  <main class="container">
+    <h2>Results: {{ exercise.title }}</h2>
+    <a id="export-result-btn" class="button" href="/api/sessions/{{ session.id }}/export">Download Result to Share</a>
+    <a class="button" href="/sessions/{{ session.id }}/ask">Ask About This Session</a>
+    <div id="results-content">Loading evaluation...</div>
+  </main>
+  <script src="/static/app.js"></script>
+  <script>loadResults();</script>
+</body>
+</html>

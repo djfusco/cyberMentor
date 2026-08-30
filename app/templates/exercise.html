@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{{ exercise.title }} - AI Exercise Mentor</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1><a href="/">AI Exercise Mentor</a></h1>
+    {% include "_nav.html" %}
+    <div id="status-bar" class="status-bar">Checking services...</div>
+  </header>
+  <main class="container">
+    <h2>{{ exercise.title }}</h2>
+    <p>{{ exercise.description }}</p>
+
+    {% if exercise.difficulty.value == 'open' %}
+    <p>
+      Difficulty:
+      <select id="difficulty-select">
+        <option value="beginner">Beginner</option>
+        <option value="intermediate" selected>Intermediate</option>
+        <option value="advanced">Advanced</option>
+      </select>
+    </p>
+    {% else %}
+    <p>Difficulty: {{ exercise.difficulty.value.capitalize() }}</p>
+    {% endif %}
+
+    {% if exercise.steps %}
+    <h3>Overview</h3>
+    <pre class="instructions">{{ exercise.instructions }}</pre>
+    <h3>Steps</h3>
+    {% for step in exercise.get_steps() %}
+    <div class="step-block">
+      <h4>{{ loop.index }}. {{ step.title }}</h4>
+      <pre class="instructions">{{ step.instructions }}</pre>
+      <ul>
+        {% for outcome in step.expected_outcomes %}
+        <li>{{ outcome.description }} <span class="weight">({{ outcome.weight }} pts)</span></li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endfor %}
+    {% else %}
+    <h3>Instructions</h3>
+    <pre class="instructions">{{ exercise.instructions }}</pre>
+
+    <h3>Expected Outcomes</h3>
+    <ul>
+      {% for outcome in exercise.expected_outcomes %}
+      <li>{{ outcome.description }} <span class="weight">({{ outcome.weight }} pts)</span></li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if exercise.sources %}
+    <h3>Sources</h3>
+    <p class="muted">What informed this exercise, for instructor confidence -- not bundled with the exercise itself.</p>
+    <ul class="sources-list">
+      {% for source in exercise.sources %}
+      <li><span class="tag">{{ source.type.value.replace('_', ' ') }}</span> {{ source.title }}{% if source.detail %} - {{ source.detail }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    <button id="start-btn" class="button primary">Start Exercise</button>
+  </main>
+  <script src="/static/app.js"></script>
+  <script>
+    refreshStatus();
+    document.getElementById('start-btn').addEventListener('click', () => {
+      const difficultySelect = document.getElementById('difficulty-select');
+      startSession('{{ exercise.id }}', difficultySelect ? difficultySelect.value : null);
+    });
+  </script>
+</body>
+</html>

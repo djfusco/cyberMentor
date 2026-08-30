@@ -1,0 +1,85 @@
+[package]
+name = "cyberalfred-capture"
+version = "0.1.0"
+edition = "2021"
+description = "Rust screen capture agent for the mentor app (EVIDENCE_PROVIDER=rust); macOS first, structured for Windows"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "cyberalfred-capture"
+path = "src/main.rs"
+
+[dependencies]
+# Cross-platform screen capture (ScreenCaptureKit on macOS, Windows.Graphics.Capture
+# on Windows). Pinned exactly to 0.0.8 -- scap's 0.1.0-beta.1 changed the Capturer
+# construction API, and this proof of concept targets the stable 0.0.x API.
+scap = "=0.0.8"
+# JSONL event serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# UTC ISO-8601 timestamps for events.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Cross-platform Ctrl-C / SIGINT handling.
+ctrlc = "3"
+# Image encoding for retained screenshots (PNG + JPEG).
+image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
+
+# macOS-only dependencies for Accessibility text extraction, Vision OCR,
+# event-driven app-change notifications (NSWorkspace), and input capture.
+# All gated behind cfg(target_os = "macos") so the crate still compiles on
+# other platforms (Windows stubs). Binary crate -> default features enabled.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", features = ["exception"] }
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-vision = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-foundation = "0.3"
+objc2-io-kit = { version = "0.3", features = ["hid"] }
+block2 = "0.6"
+
+# scap 0.0.8's Windows engine calls windows-capture's Settings::new() with the
+# old 5-argument signature (item, cursor_capture, draw_border, color_format,
+# flags). windows-capture 1.5.0 changed Settings::new() to 8 arguments
+# (adding secondary_window/minimum_update_interval/dirty_region settings)
+# without a major version bump, so Cargo's default resolver -- which is free
+# to pick anything matching scap's own "^1.3.6" requirement -- can pick 1.5.0
+# and break the build. Pin it here to the last version before that breaking
+# change so scap 0.0.8 keeps compiling on Windows. This is not used directly
+# by our own code; it exists only to constrain scap's transitive dependency.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-capture = "=1.4.4"
+
+# Windows-only dependencies for UI Automation text extraction (the Windows
+# analog of macOS Accessibility), foreground-window tracking, low-level input
+# hooks, and WinRT OCR. All gated behind cfg(target_os = "windows") so the
+# crate still compiles cleanly on macOS.
+#
+# uiautomation: a safe wrapper around CUIAutomation (CoInitializes
+# COINIT_MULTITHREADED in UIAutomation::new). Provides get_focused_element,
+# element_from_handle, get_raw_view_walker, UIElement::get_name /
+# get_property_value, UITreeWalker::get_first_child / get_next_sibling.
+# Default features (input, control, pattern) are kept.
+uiautomation = "0.25"
+
+# windows-rs: Win32 APIs (foreground window, process info, low-level hooks,
+# COM init) and WinRT OCR (Windows.Media.Ocr). Pinned to ^0.62 to match
+# uiautomation's own windows dependency so the types unify (cargo resolves
+# both to the same 0.62.x).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation",
+] }
+# windows-future: provides IAsyncOperation<T> for blocking on WinRT async
+# (OCR RecognizeAsync). The windows crate 0.62 factored async types into this
+# crate; pinning to ^0.3 to match windows 0.62's transitive dependency.
+windows-future = "0.3"

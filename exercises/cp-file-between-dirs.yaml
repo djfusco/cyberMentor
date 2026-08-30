@@ -1,0 +1,77 @@
+id: cp-file-between-dirs
+title: Copy a File Between Directories
+description: Students create two directories, add a file to one, copy it to the other,
+  and verify the copy succeeded.
+instructions: '1. Create two directories named test1 and test2.
+
+  2. Inside test1, create a file named newtest.txt (it may be empty).
+
+  3. Copy newtest.txt from test1 to test2.
+
+  4. Verify that the copy was successful by comparing the two files (e.g., using ls,
+  diff, or cat).'
+environment:
+  type: terminal
+expected_outcomes:
+- id: test1_dir_exists
+  description: Directory test1 exists
+  type: filesystem
+  weight: 20.0
+  check:
+    kind: dir_exists
+    path: test1
+    expected_mode: null
+    pattern: null
+- id: test2_dir_exists
+  description: Directory test2 exists
+  type: filesystem
+  weight: 20.0
+  check:
+    kind: dir_exists
+    path: test2
+    expected_mode: null
+    pattern: null
+- id: newtest_in_test1
+  description: File test1/newtest.txt exists
+  type: filesystem
+  weight: 20.0
+  check:
+    kind: file_exists
+    path: test1/newtest.txt
+    expected_mode: null
+    pattern: null
+- id: newtest_in_test2
+  description: File test2/newtest.txt exists
+  type: filesystem
+  weight: 20.0
+  check:
+    kind: file_exists
+    path: test2/newtest.txt
+    expected_mode: null
+    pattern: null
+- id: files_identical
+  description: Files test1/newtest.txt and test2/newtest.txt have identical content
+    and permissions
+  type: filesystem
+  weight: 20.0
+  check:
+    kind: file_mode
+    path: test2/newtest.txt
+    expected_mode: '644'
+    pattern: null
+acceptable_methods:
+- mkdir
+- touch
+- cp
+- mv
+- cat
+- diff
+- ls
+prohibited_behaviors: []
+mentor:
+  allow_questions: true
+  default_help_level: 2
+  reveal_answer: false
+signing_key: 8de81f9322c0e2787515920860bda75a
+author: null
+created_at: '2026-08-21T15:10:26.406831Z'

@@ -1,0 +1,80 @@
+id: copy-paste-workflow-analysis
+title: Copy/Paste Workflow Analysis
+description: Learners simulate a data-entry workflow by copying names and addresses
+  from a spreadsheet and pasting them into a web form, then analyze their own process
+  for efficiency and accuracy.
+instructions: 'You are given a spreadsheet (e.g., CSV or Excel) containing 10 sample
+  records with names and addresses. Using a web browser, open a simple HTML form (provided
+  locally or via a test server). For each record:
+
+  1. Copy the name and address from the spreadsheet.
+
+  2. Paste them into the form fields.
+
+  3. Submit the form.
+
+
+  After completing all entries, answer the following questions:
+
+  - How many records did you enter?
+
+  - How many times did you copy from the spreadsheet?
+
+  - How many times did you paste into the form?
+
+  - How many times did you return to the spreadsheet (e.g., to scroll, re-select,
+  or verify)?
+
+  - Did you enter any record more than once? If so, how many duplicates?
+
+
+  Record your answers in a file named `workflow_analysis.txt` in your home directory.'
+environment:
+  type: terminal
+difficulty: intermediate
+expected_outcomes:
+- id: form_completed
+  description: Learner successfully submitted 10 form entries
+  type: observed_behavior
+  weight: 40.0
+  check: null
+- id: analysis_file_created
+  description: Learner created workflow_analysis.txt with required metrics
+  type: filesystem
+  weight: 20.0
+  check:
+    kind: file_exists
+    path: ~/workflow_analysis.txt
+    expected_mode: null
+    pattern: null
+- id: metrics_present
+  description: workflow_analysis.txt contains all five required metrics
+  type: filesystem
+  weight: 20.0
+  check:
+    kind: file_contains
+    path: ~/workflow_analysis.txt
+    expected_mode: null
+    pattern: Records entered|Copies|Pastes|Returns to spreadsheet|Duplicate entries
+- id: no_duplicates
+  description: Learner reported zero duplicate entries (accuracy check)
+  type: observed_behavior
+  weight: 20.0
+  check: null
+steps: null
+acceptable_methods:
+- manual copy/paste from spreadsheet to web form
+- using clipboard history
+- using spreadsheet and browser side-by-side
+prohibited_behaviors:
+- bypassing the form (e.g., direct API calls)
+- using automated data-entry tools (e.g., macros, scripts)
+- submitting fewer than 10 entries
+mentor:
+  allow_questions: true
+  default_help_level: 2
+  reveal_answer: false
+signing_key: 4e2c384586644dc8da5bec32e49a36fe
+author: null
+created_at: '2026-08-28T01:04:40.570574Z'
+sources: []

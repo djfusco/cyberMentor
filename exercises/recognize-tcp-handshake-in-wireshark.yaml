@@ -1,0 +1,49 @@
+id: recognize-tcp-handshake-in-wireshark
+title: Recognizing the TCP 3-Way Handshake in Wireshark
+description: Students open a pre-provided pcap file containing exactly three TCP packets
+  forming a handshake, then click each packet to inspect its details and recognize
+  the handshake steps.
+instructions: Launch Wireshark and open the provided handshake.pcap file. Click on
+  each of the three packets in order (1, 2, 3) to view their details in the middle
+  pane.
+environment:
+  type: gui
+difficulty: open
+expected_outcomes:
+- id: file_opened_successfully
+  description: Wireshark displays a packet list with exactly three rows
+  type: observed_behavior
+  weight: 20.0
+  check: null
+- id: all_packets_clicked_in_order
+  description: 'Student clicks on packet #1, then #2, then #3 in sequence'
+  type: observed_behavior
+  weight: 10.0
+  check: null
+- id: tcp_flags_inspected
+  description: Student focuses on the TCP flags field for each packet (e.g., pauses
+    or hovers over flags in details pane)
+  type: observed_behavior
+  weight: 70.0
+  check: null
+steps: null
+acceptable_methods:
+- "Using File \u2192 Open to load the pcap file"
+- Dragging and dropping the pcap file into Wireshark
+- Navigating packets using mouse clicks or keyboard (Enter, Up/Down arrows)
+- Expanding the TCP tree in the details pane to view flags
+prohibited_behaviors:
+- Opening the file but not clicking any packet
+- Clicking fewer than all three packets
+- Using command-line tools (e.g., tshark) instead of the Wireshark GUI
+mentor:
+  allow_questions: true
+  default_help_level: 2
+  reveal_answer: false
+signing_key: d29b290dfbfa18b685b8e3b0ec15350c
+author: null
+created_at: '2026-08-26T21:41:41.664020Z'
+sources:
+- type: instructor_reference
+  title: Wireshark Reference Page
+  detail: software_documentation (website)

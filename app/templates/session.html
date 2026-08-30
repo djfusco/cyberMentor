@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{{ exercise.title }} - Session</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-session-id="{{ session.id }}" data-started-at="{{ session.started_at.isoformat() }}">
+  <header class="topbar">
+    <h1><a href="/">AI Exercise Mentor</a></h1>
+    {% include "_nav.html" %}
+    <div id="status-bar" class="status-bar">Checking services...</div>
+  </header>
+  <main class="container">
+    <h2>{{ exercise.title }}</h2>
+    <details open class="instructions-box">
+      <summary>Instructions</summary>
+      {% if exercise.steps %}
+      <pre class="instructions">{{ exercise.instructions }}</pre>
+      {% for step in exercise.get_steps() %}
+      <div class="step-block">
+        <h4>{{ loop.index }}. {{ step.title }}</h4>
+        <pre class="instructions">{{ step.instructions }}</pre>
+      </div>
+      {% endfor %}
+      {% else %}
+      <pre class="instructions">{{ exercise.instructions }}</pre>
+      {% endif %}
+    </details>
+
+    <div class="session-meta">
+      <span>Session duration: <strong id="duration">00:00</strong></span>
+    </div>
+
+    <section class="mentor-chat">
+      <h3>Ask the Mentor</h3>
+      <div id="chat-log" class="chat-log"></div>
+      <form id="chat-form">
+        <input type="text" id="chat-input" placeholder="Am I doing this correctly?" autocomplete="off" required>
+        <button type="submit" class="button">Ask</button>
+      </form>
+    </section>
+
+    <button id="finish-btn" class="button primary">Finish Exercise</button>
+
+    <details class="debug-box">
+      <summary>Debug / Evidence Inspector</summary>
+      <div id="debug-content">
+        <p>Load evidence to see what the mentor can currently observe.</p>
+        <button id="load-evidence-btn" class="button">Load Evidence</button>
+        <pre id="debug-output"></pre>
+      </div>
+    </details>
+  </main>
+  <script src="/static/app.js"></script>
+  <script>
+    refreshStatus();
+    initSessionPage();
+  </script>
+</body>
+</html>
