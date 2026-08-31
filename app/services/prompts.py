@@ -421,8 +421,58 @@ Observed activity timeline for the full session (most recent last):
 Analyze the learner's process and return the JSON object described in the
 system prompt. If evidence retrieval failed, your summary must say so
 explicitly and must NOT claim or imply that the learner did nothing --
-say that the learner's process could not be analyzed because activity
-capture was unavailable, and every judgment's "observed" should be false.
+        say that the learner's process could not be analyzed because activity
+        capture was unavailable, and every judgment's "observed" should be false.
+"""
+    return prompt, truncated
+
+
+def build_missing_judgments_prompt(
+    exercise: Exercise,
+    events: List[EvidenceEvent],
+    missing_ids: List[str],
+    has_images: bool = False,
+    max_events: int = 80,
+) -> Tuple[str, bool]:
+    """A focused follow-up prompt used when the first evaluation returned a
+    summary but skipped some (or all) required outcome judgments -- a common
+    failure mode for smaller vision models, which describe what they see in
+    `summary` but omit the structured `outcome_judgments` array.
+
+    Asks for the SAME JSON schema the system prompt specifies (so the existing
+    parse/repair path works unchanged), but narrows the request to ONLY the
+    missing outcome ids and re-attaches the screenshots/timeline, so the model
+    has a smaller, simpler ask with the same evidence in front of it.
+    """
+    missing_lines = "\n".join(
+        f"- {oid}: {o.description}"
+        for oid in missing_ids
+        for o in [next((oc for oc in exercise.get_all_outcomes() if oc.id == oid), None)]
+        if o is not None
+    ) or "(none)"
+    image_note = (
+        "\nThe same screenshots from this session are attached again -- examine "
+        "them directly as the primary source of truth for whether each outcome "
+        "below was observed on screen.\n"
+        if has_images
+        else ""
+    )
+    timeline, truncated = format_evidence_timeline(events, max_events=max_events)
+    prompt = f"""Your previous evaluation of this session did not include a judgment for every
+required outcome id. You MUST now provide a judgment for EACH of the outcome ids
+listed below -- no others, and do not omit any of them.
+{image_note}
+Outcomes requiring your judgment (respond with exactly one outcome_judgments entry per id below):
+{missing_lines}
+
+Observed activity timeline for the full session (most recent last):
+{timeline}
+
+Return ONLY the JSON object described in the system prompt, with an
+"outcome_judgments" array containing exactly one entry for each id listed above.
+For each, set "observed" to true only if the screenshots or timeline show the
+action or its on-screen result; otherwise false. Provide a brief evidence-based
+justification for each.
 """
     return prompt, truncated
 

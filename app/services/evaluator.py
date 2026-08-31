@@ -15,13 +15,22 @@ from app.models.evaluation import Confidence, EvaluationResult, LLMEvaluationIns
 from app.models.exercise import EnvironmentType, Exercise, ExpectedOutcome, OutcomeType
 from app.services.evidence import EvidenceEvent, EvidenceService
 from app.services.ollama import OllamaError, OllamaService
-from app.services.prompts import EVALUATION_SYSTEM_PROMPT, build_evaluation_user_prompt
+from app.services.prompts import (
+    EVALUATION_SYSTEM_PROMPT,
+    build_evaluation_user_prompt,
+    build_missing_judgments_prompt,
+)
 from app.services.token_budget import fit_to_budget
 from app.services.verifier import VerificationDetail, run_verification
 
 logger = logging.getLogger(__name__)
 
 MAX_VISION_FRAMES = 4
+# Number of screenshots attached to a FINISH-time evaluation. Higher than
+# MAX_VISION_FRAMES (used for latency-sensitive live mentor chat / session
+# Q&A) because evaluation runs once and needs to see every phase of the
+# session, not just the final state. See _select_spread_frame_paths.
+EVALUATION_MAX_VISION_FRAMES = 8
 # Maximum number of recent evidence events considered for the evaluation
 # prompt before context budgeting (app/services/token_budget.py) may shrink
 # this further to stay within the model's context window.
@@ -60,6 +69,38 @@ def _select_frame_paths(events: List[EvidenceEvent], max_frames: int = MAX_VISIO
         if len(paths) >= max_frames:
             break
     return list(reversed(paths))
+
+
+def _select_spread_frame_paths(
+    events: List[EvidenceEvent], max_frames: int = EVALUATION_MAX_VISION_FRAMES
+) -> List[str]:
+    """Pick a small, deduplicated set of screenshot paths spread evenly across
+    the WHOLE session, so the vision model sees every phase of the work -- not
+    just the final state.
+
+    A multi-step lab satisfies different outcomes at different points in time
+    (generate the pcap early, upload it next, inspect packets later, write
+    answers last). Sampling only the most recent frames -- as
+    _select_frame_paths does for latency-sensitive live chat -- leaves early
+    and mid-session steps with no screenshot evidence at all, which is how an
+    upload visible at frame 12 of 37 was never seen by the vision model.
+    Spreading the selection across the full timeline ensures each phase is
+    represented, always including the first and last frames.
+    """
+    distinct: List[str] = []
+    seen = set()
+    for event in events:
+        if event.frame_path and event.frame_path not in seen:
+            seen.add(event.frame_path)
+            distinct.append(event.frame_path)
+    if len(distinct) <= max_frames:
+        return distinct
+    if max_frames <= 1:
+        return [distinct[-1]]
+    # Evenly sample across the full span, always including the first and last.
+    n = len(distinct)
+    indices = sorted({round(i * (n - 1) / (max_frames - 1)) for i in range(max_frames)})
+    return [distinct[i] for i in indices]
 
 
 def _resolve_frame_path(path: str, session_id: Optional[str]) -> Path:
@@ -205,7 +246,9 @@ class EvaluatorService:
 
         images: List[str] = []
         if use_vision:
-            images = _encode_images(_select_frame_paths(events), session_id)
+            # Spread frames across the WHOLE session (not just the most recent)
+            # so every phase of the work is visible -- see _select_spread_frame_paths.
+            images = _encode_images(_select_spread_frame_paths(events), session_id)
             if not images:
                 use_vision, model = False, settings.ollama_model
                 reason = "screenshots could not be read; falling back to text-only"
@@ -247,10 +290,11 @@ class EvaluatorService:
 
         try:
             if use_vision:
-                return await self.ollama.evaluate(
+                insights = await self.ollama.evaluate(
                     system_prompt, prompt, images=images, model=model, num_ctx=context_size,
                 )
-            return await self.ollama.evaluate(system_prompt, prompt, num_ctx=context_size)
+            else:
+                insights = await self.ollama.evaluate(system_prompt, prompt, num_ctx=context_size)
         except OllamaError as exc:
             logger.warning("LLM evaluation unavailable: %s", exc)
             if events:
@@ -266,6 +310,67 @@ class EvaluatorService:
                     "was captured either. Scoring below relies on deterministic verification only."
                 )
             return LLMEvaluationInsights(summary=summary)
+
+        # Vision models (e.g. llava) frequently return a coherent summary but
+        # omit the structured outcome_judgments array, or fill it only partially.
+        # Because outcome_judgments defaults to an empty list and the JSON is
+        # otherwise valid, the parse/repair path never fires -- and every
+        # non-filesystem outcome silently scores "did not return a judgment".
+        # Detect missing required IDs and make ONE focused follow-up call asking
+        # only for those, then merge. Reuses the same screenshots/model/context.
+        if not evidence_error:
+            required_ids = [
+                o.id for o in exercise.get_all_outcomes() if o.id not in verification
+            ]
+            returned_ids = {j.id for j in insights.outcome_judgments}
+            missing_ids = [rid for rid in required_ids if rid not in returned_ids]
+            if missing_ids:
+                insights = await self._fill_missing_judgments(
+                    insights, exercise, events, missing_ids,
+                    images=images if use_vision else None,
+                    model=model, num_ctx=context_size,
+                )
+
+        return insights
+
+    async def _fill_missing_judgments(
+        self,
+        insights: LLMEvaluationInsights,
+        exercise: Exercise,
+        events: List[EvidenceEvent],
+        missing_ids: List[str],
+        images: Optional[List[str]] = None,
+        model: Optional[str] = None,
+        num_ctx: Optional[int] = None,
+    ) -> LLMEvaluationInsights:
+        """One focused follow-up call asking only for the outcome IDs the first
+        evaluation skipped. Smaller, simpler ask -> higher compliance from
+        weaker vision models. Merges the returned judgments into `insights`
+        (filling gaps; never overwriting a judgment the first call did return).
+        """
+        focused_prompt, _truncated = build_missing_judgments_prompt(
+            exercise, events, missing_ids, has_images=images is not None,
+        )
+        logger.info(
+            "Evaluation follow-up for %d missing outcome judgment(s): %s",
+            len(missing_ids), ", ".join(missing_ids),
+        )
+        try:
+            followup = await self.ollama.evaluate(
+                EVALUATION_SYSTEM_PROMPT, focused_prompt,
+                images=images, model=model, num_ctx=num_ctx,
+            )
+        except OllamaError as exc:
+            logger.warning("Judgment follow-up unavailable: %s", exc)
+            return insights
+
+        by_id = {j.id: j for j in insights.outcome_judgments}
+        for judgment in followup.outcome_judgments:
+            # Only fill gaps -- never overwrite a judgment the first pass produced.
+            if judgment.id not in by_id:
+                by_id[judgment.id] = judgment
+        insights.outcome_judgments = list(by_id.values())
+        return insights
 
     def _score_outcome(
         self,
