@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+mentor.db
+capture_sessions/
+.DS_Store
+native_capture/rust/target/

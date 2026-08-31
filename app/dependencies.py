@@ -68,19 +68,26 @@ def get_ollama_service() -> OllamaService:
 
 
 @lru_cache
-def get_mentor_service() -> MentorService:
-    """Mentor chat's LLM backend is chosen by MENTOR_CHAT_PROVIDER -- local
-    Ollama (default) or an opt-in frontier API key (see
+def get_mentor_chat_backend():
+    """The LLM backend for mentor chat, chosen by MENTOR_CHAT_PROVIDER --
+    local Ollama (default) or an opt-in frontier API key (see
     app/services/frontier_chat.py). This is the ONLY AI-backed feature
     affected by that setting; every other service below is unconditionally
-    Ollama-only.
+    Ollama-only. Exposed as its own function (not just an attribute on
+    MentorService) so status reporting (app/services/chat_status.py) can
+    reuse it without constructing a second instance.
     """
     settings = get_settings()
     if settings.mentor_chat_provider == "frontier":
         from app.services.frontier_chat import FrontierChatService
 
-        return MentorService(get_evidence_service(), FrontierChatService())
-    return MentorService(get_evidence_service(), get_ollama_service())
+        return FrontierChatService()
+    return get_ollama_service()
+
+
+@lru_cache
+def get_mentor_service() -> MentorService:
+    return MentorService(get_evidence_service(), get_mentor_chat_backend())
 
 
 @lru_cache

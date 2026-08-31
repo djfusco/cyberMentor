@@ -5,6 +5,7 @@ async function refreshStatus() {
     const res = await fetch('/api/health');
     const data = await res.json();
     const evidence = data.evidence || {};
+    const chat = data.chat || {};
     let ev;
     const label = evidence.label || 'Evidence';
     if (!evidence.connected) {
@@ -14,10 +15,11 @@ async function refreshStatus() {
     } else {
       ev = `Evidence: ${label} \u2014 Ready`;
     }
-    const ol = data.ollama.connected ? 'Ollama: Connected' : 'Ollama: Not connected';
-    el.textContent = `${ev}  |  ${ol} (${data.ollama.model})`;
-    el.title = [evidence.hint, data.ollama.hint].filter(Boolean).join(' | ');
-    const allOk = evidence.connected && evidence.evidence_access && data.ollama.connected;
+    const chatLabel = chat.label || 'Chat';
+    const ol = chat.connected ? `${chatLabel}: Connected` : `${chatLabel}: Not connected`;
+    el.textContent = `${ev}  |  ${ol} (${chat.model})`;
+    el.title = [evidence.hint, chat.hint].filter(Boolean).join(' | ');
+    const allOk = evidence.connected && evidence.evidence_access && chat.connected;
     el.classList.toggle('warn', !allOk);
   } catch (err) {
     el.textContent = 'Unable to check service status.';

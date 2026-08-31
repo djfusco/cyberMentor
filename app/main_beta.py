@@ -39,19 +39,20 @@ async def on_startup() -> None:
 
 @app.get("/api/health")
 async def health():
-    """Minimal health check for the beta build -- Ollama connectivity only.
-    See app/main.py's fuller _evidence_status for the normal app's version."""
-    from app.dependencies import get_ollama_service
-    from app.config import get_settings
+    """Same shape as app/main.py's health endpoint (evidence provider status
+    + mentor chat backend status), sharing app/services/evidence_status.py
+    and app/services/chat_status.py rather than duplicating that logic here."""
+    from app.dependencies import get_evidence_provider, get_mentor_chat_backend
+    from app.services.chat_status import get_chat_status
+    from app.services.evidence_status import get_evidence_status
 
-    settings = get_settings()
-    ollama = get_ollama_service()
-    ollama_ok = await ollama.health()
+    provider = get_evidence_provider()
+    chat_backend = get_mentor_chat_backend()
+
+    evidence_status = await get_evidence_status(provider)
+    chat_status = await get_chat_status(chat_backend)
+
     return {
-        "ollama": {
-            "connected": ollama_ok,
-            "url": settings.ollama_base_url,
-            "model": settings.ollama_model,
-            "hint": None if ollama_ok else "Start it with: ollama serve",
-        },
+        "evidence": evidence_status,
+        "chat": chat_status,
     }
