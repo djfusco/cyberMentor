@@ -29,8 +29,11 @@ MAX_VISION_FRAMES = 4
 # Number of screenshots attached to a FINISH-time evaluation. Higher than
 # MAX_VISION_FRAMES (used for latency-sensitive live mentor chat / session
 # Q&A) because evaluation runs once and needs to see every phase of the
-# session, not just the final state. See _select_spread_frame_paths.
-EVALUATION_MAX_VISION_FRAMES = 8
+# session, not just the final state. Frames are downscaled before encoding
+# (see _downscale_image_bytes), so 16 downsampled frames cost roughly what
+# 8 full-resolution frames did before -- buying ~2x coverage of the session
+# timeline without raising wall-clock time. See _select_spread_frame_paths.
+EVALUATION_MAX_VISION_FRAMES = 16
 # Maximum number of recent evidence events considered for the evaluation
 # prompt before context budgeting (app/services/token_budget.py) may shrink
 # this further to stay within the model's context window.
@@ -117,15 +120,51 @@ def _resolve_frame_path(path: str, session_id: Optional[str]) -> Path:
     return capture_output / str(session_id) / candidate
 
 
+# Screenshots are captured at native display resolution (e.g. 4096x2304 on a
+# retina mac) but vision models downsample internally anyway -- sending full
+# resolution costs ~10x the tokens/time for detail the model can't use. Resize
+# to this width (preserving aspect ratio) before base64-encoding. Wide enough
+# to keep on-screen text/buttons/confirmations legible to the model.
+VISION_FRAME_MAX_WIDTH = 1280
+
+
+def _downscale_image_bytes(raw: bytes, max_width: int = VISION_FRAME_MAX_WIDTH) -> bytes:
+    """Downscale an image to max_width (aspect ratio preserved), returning
+    JPEG bytes. Falls back to the original bytes unchanged when Pillow is not
+    installed or the input isn't a decodable image -- so callers (and tests
+    using fake bytes) never hard-fail on resizing, only lose the optimization.
+    """
+    try:
+        import io
+
+        from PIL import Image
+    except ImportError:
+        return raw
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception:  # noqa: BLE001 -- non-image bytes / corrupt frames: fall back, don't crash
+        return raw
+    if img.width > max_width:
+        ratio = max_width / img.width
+        new_size = (max_width, max(1, round(img.height * ratio)))
+        img = img.resize(new_size, Image.LANCZOS)
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="JPEG", quality=85)
+    return out.getvalue()
+
+
 def _encode_images(paths: List[str], session_id: Optional[str] = None) -> List[str]:
     encoded: List[str] = []
     for path in paths:
         resolved = _resolve_frame_path(path, session_id)
         try:
             with open(resolved, "rb") as f:
-                encoded.append(base64.b64encode(f.read()).decode("ascii"))
+                raw = f.read()
         except OSError as exc:
             logger.warning("Could not read screenshot frame %s for vision evaluation: %s", resolved, exc)
+            continue
+        encoded.append(base64.b64encode(_downscale_image_bytes(raw)).decode("ascii"))
     return encoded
 
 
@@ -442,13 +481,20 @@ class EvaluatorService:
             )
 
         if judgment is not None and judgment.observed:
+            # Screenshots are the primary source of truth for visual exercises
+            # (see _select_model): when the vision model directly observes an
+            # action on screen, that is direct evidence -- not inference -- so it
+            # earns full credit, the same as a deterministic filesystem check.
+            # The strict evidence rules in EVALUATION_SYSTEM_PROMPT guard against
+            # false positives; if those prove too loose in practice, tighten the
+            # prompt rather than re-capping real observations at half credit.
             return OutcomeResult(
                 id=outcome.id,
                 passed=True,
-                score=round(outcome.weight * 0.5, 1),
+                score=outcome.weight,
                 max_score=outcome.weight,
-                confidence=Confidence.inferred,
-                evidence=judgment.evidence or "AI inferred this occurred from the activity timeline.",
+                confidence=Confidence.strongly_observed,
+                evidence=judgment.evidence or "Observed in captured screenshots/activity.",
             )
 
         if judgment is None:
