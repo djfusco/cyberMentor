@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     ollama_model_num_ctx: int = 32768
 
     ollama_timeout_seconds: float = 60.0
+    # Per-call timeout for Finish-time evaluation LLM calls. Vision
+    # evaluation attaches up to 8 screenshots and asks for a structured JSON
+    # object, which can take well over a minute on a local vision model (e.g.
+    # ~54s observed for qwen2.5vl:7b with 8 images) -- the default 60s timeout
+    # above is too short and times out before the model finishes. Separate
+    # from ollama_timeout_seconds so the heavier evaluation call gets room
+    # without also raising the lighter mentor-chat timeout. Override with
+    # EVALUATION_TIMEOUT_SECONDS.
+    evaluation_timeout_seconds: float = 180.0
     # Per-call timeout for SessionQueryService LLM calls only (the
     # "Ask About This Session" feature). Separate from
     # ollama_timeout_seconds so a slower, evidence-grounded session query can

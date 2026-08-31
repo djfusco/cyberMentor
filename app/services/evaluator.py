@@ -254,6 +254,12 @@ class EvaluatorService:
                 reason = "screenshots could not be read; falling back to text-only"
 
         context_size = VISION_NUM_CTX if use_vision else settings.ollama_model_num_ctx
+        # Vision evaluation attaches up to 8 screenshots and asks for a large
+        # structured JSON object -- that takes well over the default 60s chat
+        # timeout on a local vision model, so use the dedicated (longer)
+        # evaluation timeout. Text-only evaluation is lighter but still gets
+        # the same room; the setting is evaluation-scoped, not vision-scoped.
+        eval_timeout = settings.evaluation_timeout_seconds
 
         def render(count: int):
             prompt, per_event_truncated = build_evaluation_user_prompt(
@@ -291,10 +297,13 @@ class EvaluatorService:
         try:
             if use_vision:
                 insights = await self.ollama.evaluate(
-                    system_prompt, prompt, images=images, model=model, num_ctx=context_size,
+                    system_prompt, prompt, images=images, model=model,
+                    num_ctx=context_size, timeout=eval_timeout,
                 )
             else:
-                insights = await self.ollama.evaluate(system_prompt, prompt, num_ctx=context_size)
+                insights = await self.ollama.evaluate(
+                    system_prompt, prompt, num_ctx=context_size, timeout=eval_timeout,
+                )
         except OllamaError as exc:
             logger.warning("LLM evaluation unavailable: %s", exc)
             if events:
@@ -328,7 +337,7 @@ class EvaluatorService:
                 insights = await self._fill_missing_judgments(
                     insights, exercise, events, missing_ids,
                     images=images if use_vision else None,
-                    model=model, num_ctx=context_size,
+                    model=model, num_ctx=context_size, timeout=eval_timeout,
                 )
 
         return insights
@@ -342,6 +351,7 @@ class EvaluatorService:
         images: Optional[List[str]] = None,
         model: Optional[str] = None,
         num_ctx: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> LLMEvaluationInsights:
         """One focused follow-up call asking only for the outcome IDs the first
         evaluation skipped. Smaller, simpler ask -> higher compliance from
@@ -358,7 +368,7 @@ class EvaluatorService:
         try:
             followup = await self.ollama.evaluate(
                 EVALUATION_SYSTEM_PROMPT, focused_prompt,
-                images=images, model=model, num_ctx=num_ctx,
+                images=images, model=model, num_ctx=num_ctx, timeout=timeout,
             )
         except OllamaError as exc:
             logger.warning("Judgment follow-up unavailable: %s", exc)

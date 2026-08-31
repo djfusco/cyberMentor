@@ -330,6 +330,24 @@ not happen merely because the text timeline does not explicitly describe it --
 if a screenshot shows the action or its on-screen result, that is sufficient
 evidence it was observed.
 
+STRICT EVIDENCE RULES for every outcome judgment (these prevent false credit):
+- Mark an outcome observed=true ONLY when a screenshot or timeline event
+  directly shows the learner PERFORMED the action, OR shows its direct
+  on-screen result. Example: an "Upload complete. 1 file imported."
+  confirmation message is direct evidence the upload happened.
+- A UI element merely being VISIBLE is not evidence the learner interacted
+  with it. Seeing a filter input field, a dropdown, or a button on screen
+  does NOT prove the learner applied a filter, opened a menu, or clicked
+  anything. The element existing is not the same as the learner using it.
+- NEVER use the exercise instructions or outcome descriptions as evidence.
+  The instructions state what the learner SHOULD do, not what they DID do.
+  "The instructions mention taking annotated screenshots" is NEVER evidence
+  that screenshots were taken. Judge only what the screenshots and timeline
+  show, not what the lab expects.
+- If no screenshot or timeline event directly shows the action or its result,
+  mark it observed=false, even if the learner most likely did it as part of
+  the workflow. Doubt goes to not-observed, not to credit.
+
 You are NOT responsible for deciding pass/fail on objective, deterministically
 verified outcomes (e.g. filesystem state) -- that has already been decided and
 is provided to you as ground truth. Do not contradict it.

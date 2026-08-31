@@ -119,7 +119,7 @@ class OllamaService:
                 resp = await client.post(f"{self.base_url}/api/chat", json=payload)
         except httpx.TimeoutException as exc:
             raise OllamaError(
-                f"Ollama timed out after {effective_timeout:.0f}s. The model '{self.model}' may be slow "
+                f"Ollama timed out after {effective_timeout:.0f}s. The model '{payload['model']}' may be slow "
                 "to respond or still loading."
             ) from exc
         except httpx.HTTPError as exc:
@@ -152,8 +152,8 @@ class OllamaService:
         content = (data.get("message") or {}).get("content", "")
         if not content:
             raise OllamaError(
-                f"Ollama returned an empty response. Is the model '{self.model}' installed? "
-                f"Try: ollama pull {self.model}"
+                f"Ollama returned an empty response. Is the model '{payload['model']}' installed? "
+                f"Try: ollama pull {payload['model']}"
             )
         return content
 
@@ -164,9 +164,11 @@ class OllamaService:
         images: Optional[List[str]] = None,
         model: Optional[str] = None,
         num_ctx: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> LLMEvaluationInsights:
         raw = await self.chat(
-            system_prompt, user_prompt, temperature=0.2, images=images, model=model, num_ctx=num_ctx
+            system_prompt, user_prompt, temperature=0.2, images=images,
+            model=model, num_ctx=num_ctx, timeout=timeout,
         )
         parsed = self._try_parse(raw)
         if parsed is not None:
@@ -179,7 +181,7 @@ class OllamaService:
         # that response, so resending screenshots here would just double the
         # image/token cost for no benefit. Model/context stay the same.
         raw_retry = await self.chat(
-            system_prompt, repair_prompt, temperature=0.0, model=model, num_ctx=num_ctx
+            system_prompt, repair_prompt, temperature=0.0, model=model, num_ctx=num_ctx, timeout=timeout,
         )
         parsed_retry = self._try_parse(raw_retry)
         if parsed_retry is not None:
