@@ -39,10 +39,13 @@ EVALUATION_MIN_EVENTS = 10
 # trimming evidence (see token_budget.py), not by raising this further.
 VISION_NUM_CTX = 65536
 
-# A GUI/SIEM/web exercise is only routed to the vision model when captured
-# text/AX/OCR evidence is too sparse to judge outcomes from alone -- these
-# thresholds define "sparse". environment.type is a routing hint, not the
-# sole rule (see _select_model).
+# Used by session-query routing (app/services/session_query.py), NOT by
+# evaluation routing. Session Q&A is interactive and cost-sensitive, so it
+# only attaches screenshots when the question is visual or genuine captured
+# text is sparse; evaluation instead treats screenshots as the primary
+# source of truth whenever they exist (see _select_model). Kept here so
+# session_query can reuse the same "is there enough real text to answer
+# without images?" heuristic without a second copy.
 MIN_SUBSTANTIVE_TEXT_EVENTS = 3
 MIN_SUBSTANTIVE_TEXT_CHARS = 40
 
@@ -103,10 +106,19 @@ def _select_model(exercise: Exercise, events: List[EvidenceEvent], settings) -> 
     """Chooses which Ollama model evaluates this session, and why.
 
     Terminal exercises have no separate visual state beyond what is already
-    captured as text, so they never need the vision model. GUI/SIEM/web
-    exercises only fall back to the vision model when captured text
-    evidence is too sparse to judge outcomes from alone AND screenshots are
-    actually available -- environment.type is a hint, not the sole rule.
+    captured as text, so they never need the vision model.
+
+    For every other exercise type (gui/siem/web/...), captured screenshots
+    are the PRIMARY source of truth for what the learner actually did. The
+    text timeline is only supplementary: window titles, click coordinates,
+    and key-count summaries carry no element names or typed content, and OCR
+    is frequently garbled (e.g. a real capture turned a Word answer document
+    into "TIC\nLUIL\nVICVV..."). Routing on a raw text-LENGTH heuristic
+    suppressed vision whenever window titles were long enough -- i.e.
+    exactly when screenshots were most needed. So whenever a vision model is
+    configured AND screenshots were captured, route to the vision model and
+    attach them. Fall back to the text model only when there are no
+    screenshots to look at (or no vision model is configured).
     """
     if exercise.environment.type == EnvironmentType.terminal:
         return _ModelRouting(
@@ -116,12 +128,10 @@ def _select_model(exercise: Exercise, events: List[EvidenceEvent], settings) -> 
         return _ModelRouting(settings.ollama_model, False, "vision model not configured")
     if not _select_frame_paths(events):
         return _ModelRouting(settings.ollama_model, False, "no screenshots captured for this session")
-    if _has_sufficient_text_evidence(events):
-        return _ModelRouting(settings.ollama_model, False, "text evidence sufficient")
     return _ModelRouting(
         settings.ollama_vision_model,
         True,
-        "insufficient text evidence for a visual exercise; using screenshots",
+        "visual exercise with screenshots: using screenshots as primary evidence",
     )
 
 

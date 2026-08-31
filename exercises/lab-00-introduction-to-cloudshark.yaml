@@ -1,0 +1,85 @@
+id: lab-00-introduction-to-cloudshark
+title: 'Lab 00: Introduction to CloudShark'
+description: "Students analyze a personalized packet capture (PCAP) using Penn State\u2019\
+  s CloudShark instance, explore the interface, apply display filters, and document\
+  \ findings with annotated screenshots and written explanations."
+instructions: "1. Generate and download a personalized .pcap file using the PolyPCAP\
+  \ generator with your Penn State email.\n2. Record your identity values: email address,\
+  \ exercise code, and exact filename.\n3. Upload the capture to Penn State\u2019\
+  s CloudShark instance (use the Penn State VPN if off campus).\n4. Using the provided\
+  \ lab question list as a guide:\n   - Explore the packet list, open individual frames,\
+  \ and expand protocol layers.\n   - Locate specific fields and apply/clear display\
+  \ filters as instructed.\n   - For each numbered question, submit:\n     - A readable\
+  \ screenshot of the full CloudShark interface,\n     - Clear annotations identifying\
+  \ the relevant packet, field, or filter,\n     - A written explanation of how the\
+  \ evidence supports your answer."
+environment:
+  type: gui
+difficulty: intermediate
+expected_outcomes:
+- id: pcap_generated_and_downloaded
+  description: Student successfully generates and downloads a personalized .pcap file
+    using the PolyPCAP generator with their Penn State email.
+  type: filesystem
+  weight: 10.0
+  check:
+    kind: file_exists
+    path: ~/Downloads/*.pcap
+    expected_mode: null
+    pattern: null
+- id: identity_values_recorded
+  description: Student records identity values (email, exercise code, filename) from
+    the generator.
+  type: observed_behavior
+  weight: 10.0
+  check: null
+- id: capture_uploaded_to_cloudshark
+  description: "Student uploads the correct .pcap file to Penn State\u2019s CloudShark\
+    \ instance."
+  type: observed_behavior
+  weight: 10.0
+  check: null
+- id: interface_explored_packet_list_and_details
+  description: Student explores the packet list view, opens individual frames, and
+    expands protocol layers in CloudShark.
+  type: observed_behavior
+  weight: 15.0
+  check: null
+- id: display_filters_applied_and_cleared
+  description: Student applies and clears display filters as instructed, verifying
+    interface updates accordingly.
+  type: observed_behavior
+  weight: 15.0
+  check: null
+- id: screenshots_submitted_with_annotations
+  description: Student submits readable screenshots of the full CloudShark interface
+    for each question, with clear annotations identifying packets, fields, or filters.
+  type: observed_behavior
+  weight: 20.0
+  check: null
+- id: written_explanations_provided
+  description: Student provides written explanations for each question that directly
+    reference annotated evidence and reasoning.
+  type: observed_behavior
+  weight: 20.0
+  check: null
+steps: null
+acceptable_methods:
+- "Use of Penn State\u2019s CloudShark instance only"
+- Use of personal .pcap generated via the official PolyPCAP generator
+- Annotation of screenshots with arrows, labels, or highlights pointing to specific
+  packets, fields, or filter entries
+- Written explanations referencing annotated evidence
+prohibited_behaviors:
+- "Using another student\u2019s .pcap or values"
+- Submitting unannotated screenshots or screenshots missing the full interface
+- Providing only a value without supporting evidence and reasoning
+- Fabricating or guessing field values
+mentor:
+  allow_questions: true
+  default_help_level: 2
+  reveal_answer: false
+signing_key: f2b05f5f8d592b566dbdca84bc049ebf
+author: null
+created_at: '2026-08-31T14:31:53.823644Z'
+sources: []

@@ -4,6 +4,7 @@ The mentor is a teacher, not an autonomous agent -- it never executes
 commands on the student's behalf.
 """
 import logging
+from dataclasses import dataclass
 from typing import List, Optional
 
 from sqlmodel import Session, select
@@ -11,8 +12,9 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.models.exercise import DifficultyLevel, EnvironmentType, Exercise
 from app.models.session import ExerciseSession, MentorMessage, MentorMessageRole
-from app.services.evidence import EvidenceService
+from app.services.evidence import EvidenceEvent, EvidenceService
 from app.services.evidence_provider import EvidenceProviderError
+from app.services.evaluator import VISION_NUM_CTX, _encode_images, _select_frame_paths
 from app.services.ollama import OllamaError, OllamaService
 from app.services.prompts import build_mentor_system_prompt, build_mentor_user_prompt
 from app.services.token_budget import fit_to_budget
@@ -36,6 +38,58 @@ def _effective_difficulty(exercise: Exercise, session: ExerciseSession) -> str:
         return exercise.difficulty.value
     chosen = session.student_difficulty or DifficultyLevel.intermediate
     return chosen.value if isinstance(chosen, DifficultyLevel) else str(chosen)
+
+
+@dataclass
+class _MentorModelRouting:
+    # model is None on the text-only path so whichever chat backend is active
+    # (OllamaService OR the opt-in FrontierChatService) uses its own default
+    # model. It is only set on the vision path, which is exclusively Ollama.
+    model: Optional[str]
+    use_vision: bool
+    reason: str
+
+
+def _route_mentor_model(
+    exercise: Exercise, events: List[EvidenceEvent], settings
+) -> _MentorModelRouting:
+    """Decide whether the in-exercise mentor chat attaches screenshots.
+
+    Mirrors the evaluator's _select_model: terminal exercises never need
+    vision (text/AX evidence is already authoritative for them); every other
+    exercise type routes to the vision model whenever one is configured AND
+    screenshots were captured. Screenshots are the primary source of truth
+    for on-screen actions in a GUI/web/SIEM app -- the text timeline alone
+    (window titles, click coordinates, key-count summaries) cannot confirm
+    what a learner actually did, which is why the mentor previously told
+    students it "wasn't sure" they did the steps.
+
+    One difference from the evaluator: mentor chat can run on the opt-in
+    frontier (e.g. OpenAI) backend, which does NOT accept image attachments
+    (FrontierChatService.chat raises if given images). When a non-Ollama
+    backend is active, mentor chat stays text-only even for visual exercises
+    -- screenshots are still used at Finish-time evaluation, which always
+    runs on local Ollama regardless of MENTOR_CHAT_PROVIDER.
+    """
+    if exercise.environment.type == EnvironmentType.terminal:
+        return _MentorModelRouting(
+            None, False, "terminal exercise: text/AX evidence is authoritative"
+        )
+    if settings.mentor_chat_provider != "ollama":
+        return _MentorModelRouting(
+            None, False, "non-Ollama mentor chat backend; image attachments unsupported"
+        )
+    if not settings.ollama_vision_model:
+        return _MentorModelRouting(None, False, "vision model not configured")
+    if not _select_frame_paths(events):
+        return _MentorModelRouting(
+            None, False, "no screenshots captured for this session"
+        )
+    return _MentorModelRouting(
+        settings.ollama_vision_model,
+        True,
+        "visual exercise with screenshots: using screenshots as primary evidence",
+    )
 
 
 class MentorService:
@@ -71,23 +125,48 @@ class MentorService:
 
         effective_difficulty = _effective_difficulty(exercise, session)
         system_prompt = build_mentor_system_prompt(exercise, level, effective_difficulty)
-        context_size = get_settings().ollama_model_num_ctx
+
+        settings = get_settings()
+        routing = _route_mentor_model(exercise, events, settings)
+        use_vision, model, reason = routing.use_vision, routing.model, routing.reason
+
+        images: List[str] = []
+        if use_vision:
+            images = _encode_images(_select_frame_paths(events), str(session.id))
+            if not images:
+                use_vision, model = False, None
+                reason = "screenshots could not be read; falling back to text-only"
+
+        context_size = VISION_NUM_CTX if use_vision else settings.ollama_model_num_ctx
 
         def render(count: int):
             prompt, truncated = build_mentor_user_prompt(
-                exercise, events, verification, question, evidence_error, max_events=count
+                exercise, events, verification, question, evidence_error,
+                has_images=use_vision, max_events=count,
             )
             return system_prompt, prompt, truncated
 
         system_prompt, user_prompt, _selected, _tokens, _truncated = fit_to_budget(
-            render, MENTOR_MAX_EVENTS, context_size, min_count=MENTOR_MIN_EVENTS
+            render, MENTOR_MAX_EVENTS, context_size,
+            image_count=len(images) if use_vision else 0, min_count=MENTOR_MIN_EVENTS,
+        )
+
+        logger.info(
+            "Mentor routing: exercise_type=%s model=%s reason=%s "
+            "raw_events=%d screenshots=%d",
+            exercise.environment.type.value, model, reason, len(events), len(images),
         )
 
         db.add(MentorMessage(session_id=session.id, role=MentorMessageRole.student, message=question))
         db.commit()
 
         try:
-            answer = await self.ollama.chat(system_prompt, user_prompt, num_ctx=context_size)
+            answer = await self.ollama.chat(
+                system_prompt, user_prompt,
+                images=images if use_vision else None,
+                model=model,
+                num_ctx=context_size,
+            )
         except OllamaError as exc:
             answer = (
                 f"I can't reach the AI model right now ({exc}). "

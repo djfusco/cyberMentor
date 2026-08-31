@@ -22,10 +22,12 @@ class Settings(BaseSettings):
 
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3-coder-next:latest"
-    # Multimodal model used for vision-assisted evaluation at Finish time (not
-    # mentor chat, which stays text-only for latency). Must be pulled
-    # separately (e.g. `ollama pull llava`). Set to empty string to disable
-    # vision-assisted evaluation entirely.
+    # Multimodal model used for vision-assisted evaluation at Finish time AND
+    # for in-exercise mentor chat on visual (non-terminal) exercises when
+    # screenshots were captured (see app/services/evaluator.py and
+    # app/services/mentor.py). Must be pulled separately (e.g.
+    # `ollama pull llava`). Set to empty string to disable vision-assisted
+    # evaluation and mentor-chat screenshots entirely.
     ollama_vision_model: str = "llava:latest"
     # Assumed context window (tokens) of the default text model, used to
     # budget/estimate prompt size before a request (see

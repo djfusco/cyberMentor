@@ -13,11 +13,12 @@ Two ways an outcome gets deterministic verification:
    chat flow (app/services/exercise_author.py) get real verification without
    anyone writing Python for them.
 """
+import glob
 import os
 import re
 import stat
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 
 from pydantic import BaseModel
 
@@ -41,6 +42,17 @@ class Verifier(Protocol):
 def _mode_str(path: Path) -> str:
     mode = stat.S_IMODE(os.stat(path).st_mode)
     return format(mode, "03o")
+
+
+def _glob_matches(path: Path) -> List[Path]:
+    """Expand shell-style wildcards in a path to the entries that exist.
+
+    Only called when glob.has_magic reports wildcards in the (already
+    ~-expanded) path -- literal paths are checked directly via is_file()/
+    is_dir() and never globbed, so a real filename that happens to contain
+    glob metacharacters is never accidentally treated as a pattern.
+    """
+    return [Path(p) for p in glob.glob(str(path))]
 
 
 class LinuxFilePermissionsVerifier:
@@ -115,6 +127,15 @@ class GenericDeclarativeVerifier:
         path = Path(check.path).expanduser()
         try:
             if check.kind == CheckKind.dir_exists:
+                if glob.has_magic(str(path)):
+                    matches = [p for p in _glob_matches(path) if p.is_dir()]
+                    passed = bool(matches)
+                    note = (
+                        f"{path} matched {len(matches)} director{'y' if len(matches) == 1 else 'ies'}."
+                        if passed
+                        else f"{path} matched no directories."
+                    )
+                    return VerificationDetail(passed=passed, actual=passed, expected=True, note=note)
                 passed = path.is_dir()
                 return VerificationDetail(
                     passed=passed,
@@ -124,6 +145,15 @@ class GenericDeclarativeVerifier:
                 )
 
             if check.kind == CheckKind.file_exists:
+                if glob.has_magic(str(path)):
+                    matches = [p for p in _glob_matches(path) if p.is_file()]
+                    passed = bool(matches)
+                    if passed:
+                        names = ", ".join(p.name for p in matches[:5])
+                        note = f"{path} matched {len(matches)} file(s): {names}."
+                    else:
+                        note = f"{path} matched no files."
+                    return VerificationDetail(passed=passed, actual=passed, expected=True, note=note)
                 passed = path.is_file()
                 return VerificationDetail(
                     passed=passed,

@@ -25,6 +25,13 @@ You know:
 - deterministic verification results,
 - observed activity from the learner's screen.
 
+When screenshots of the learner's screen are attached to the student's
+message, treat them as the primary source of truth for what the learner has
+actually done. The text activity timeline is supplementary -- it records
+window titles, click coordinates, and key-count summaries (no element names
+or typed content), and OCR may be garbled. Do not tell the learner you
+cannot see evidence of a step if a screenshot shows it.
+
 Your goal is to help the learner reason through the exercise.
 
 {difficulty_instructions}
@@ -191,12 +198,24 @@ def build_mentor_user_prompt(
     verification: Optional[dict],
     question: str,
     evidence_error: Optional[str] = None,
+    has_images: bool = False,
     max_events: int = 40,
 ) -> Tuple[str, bool]:
     outcomes = format_outcomes_by_step(exercise)
     timeline, truncated = format_evidence_timeline(events, max_events=max_events, evidence_error=evidence_error)
+    image_note = (
+        "\nScreenshots of the learner's screen are attached to this message. They are "
+        "the PRIMARY source of truth for what the learner has actually done so far -- "
+        "examine them directly for on-screen actions and UI state. The text activity "
+        "timeline below is supplementary (window titles, click coordinates, and "
+        "key-count summaries carry no element names or typed content, and OCR may be "
+        "garbled). Do not tell the learner you cannot see evidence of a step if a "
+        "screenshot shows it.\n"
+        if has_images
+        else ""
+    )
     prompt = f"""Exercise: {exercise.title}
-
+{image_note}
 Instructions:
 {exercise.instructions}
 
@@ -302,6 +321,15 @@ single task or a sequence of steps in one or more applications (terminal,
 browser, or any other software) -- judge each outcome independently based on
 its own description, not assumptions from any other exercise type.
 
+When screenshots from the session are attached to the user message, treat
+them as the PRIMARY source of truth for what the learner actually did on
+screen. The text activity timeline is supplementary context only: window
+titles, click coordinates, and key-count summaries carry no element names or
+typed content, and OCR text is frequently garbled. Do NOT conclude a step did
+not happen merely because the text timeline does not explicitly describe it --
+if a screenshot shows the action or its on-screen result, that is sufficient
+evidence it was observed.
+
 You are NOT responsible for deciding pass/fail on objective, deterministically
 verified outcomes (e.g. filesystem state) -- that has already been decided and
 is provided to you as ground truth. Do not contradict it.
@@ -356,9 +384,13 @@ def build_evaluation_user_prompt(
     acceptable = "\n".join(f"- {m}" for m in exercise.acceptable_methods) or "(none specified)"
     prohibited = "\n".join(f"- {m}" for m in exercise.prohibited_behaviors) or "(none specified)"
     image_note = (
-        "\nOne or more screenshots from the session are attached to this message -- "
-        "examine them directly for visual details (layout, colors, charts, on-screen "
-        "state) that OCR text alone might miss or garble.\n"
+        "\nScreenshots from this session are attached to this message. They are the "
+        "PRIMARY source of truth for what the learner did -- examine them directly for "
+        "on-screen actions, UI state, filled-in fields, open panels, and results. The "
+        "text timeline below is supplementary context (it records window titles, click "
+        "coordinates, and key-count summaries -- no element names or typed content -- "
+        "and OCR may be garbled). Do not treat absence from the text timeline as "
+        "absence of the action if a screenshot shows it.\n"
         if has_images
         else ""
     )
