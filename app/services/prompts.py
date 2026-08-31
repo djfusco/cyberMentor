@@ -413,6 +413,23 @@ def build_evaluation_user_prompt(
         else ""
     )
     timeline, truncated = format_evidence_timeline(events, max_events=max_events, evidence_error=evidence_error)
+    if evidence_error:
+        closing = (
+            "Analyze the learner's process and return the JSON object described in "
+            "the system prompt. Evidence retrieval FAILED, so your summary must say "
+            "so explicitly and must NOT claim or imply that the learner did anything "
+            "-- say the learner's process could not be analyzed because activity "
+            "capture was unavailable, and every judgment's \"observed\" must be false."
+        )
+    else:
+        closing = (
+            "Analyze the learner's process and return the JSON object described in "
+            "the system prompt. Judge each outcome solely from the screenshots and "
+            "timeline above, applying the strict evidence rules: mark observed=true "
+            "only when the evidence directly shows the action or its on-screen result, "
+            "and false otherwise. Do not claim an outcome did not happen unless you "
+            "have examined the screenshots and found no evidence of it."
+        )
     prompt = f"""Exercise: {exercise.title}
 {image_note}
 Instructions:
@@ -436,11 +453,7 @@ Deterministic verification (ground truth, do not contradict):
 Observed activity timeline for the full session (most recent last):
 {timeline}
 
-Analyze the learner's process and return the JSON object described in the
-system prompt. If evidence retrieval failed, your summary must say so
-explicitly and must NOT claim or imply that the learner did nothing --
-        say that the learner's process could not be analyzed because activity
-        capture was unavailable, and every judgment's "observed" should be false.
+{closing}
 """
     return prompt, truncated
 
