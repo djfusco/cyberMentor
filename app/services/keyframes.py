@@ -66,6 +66,10 @@ class SelectedFrame:
     window_title: Optional[str]
     trigger_type: str  # anchor event type or 'spread'
     role: str          # 'before' | 'after' | 'spread'
+    # Timestamp of the anchor event that caused this frame to be selected.
+    # None for spread frames (no anchor) and for frames selected before this
+    # field was introduced. Populated for before/after anchor frames only.
+    anchor_timestamp: object = None  # datetime or None
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +187,7 @@ def select_keyframes(
                     window_title=fe.window_title,
                     trigger_type=anchor_event.type,
                     role=role,
+                    anchor_timestamp=anchor_event.timestamp,
                 )
             )
 

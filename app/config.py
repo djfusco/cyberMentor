@@ -97,8 +97,13 @@ class Settings(BaseSettings):
     # absolute path if you publish elsewhere. Only used when
     # evidence_provider == "native_windows".
     native_windows_capture_executable: str = str(BASE_DIR / "native_capture" / "windows" / "bin" / "mentor-capture.exe")
-    # Shared by both native providers: capture_sessions/<session_id>/{events.jsonl,frames/}
+    # Shared by both native providers: capture_sessions/<capture_run_id>/{events.jsonl,frames/}
     native_capture_output: str = str(BASE_DIR / "capture_sessions")
+
+    # When True, write diagnostic payload files (text prompts + image metadata,
+    # no base64 or API secrets) into <capture_dir>/diags/ for each model call.
+    # Disabled by default; set MENTOR_DIAGNOSTICS=true in .env to enable.
+    mentor_diagnostics: bool = False
 
 
 @lru_cache

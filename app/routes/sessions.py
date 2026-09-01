@@ -1,6 +1,8 @@
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,6 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
+from app.config import get_settings
 from app.database import get_session
 from app.dependencies import (
     get_evaluator_service,
@@ -19,6 +22,7 @@ from app.models.evaluation import Evaluation, EvaluationResult
 from app.models.exercise import DifficultyLevel, Exercise
 from app.models.session import ExerciseSession, SessionStatus
 from app.services import settings_service
+from app.services.capture_manifest import ManifestWriter
 from app.services.evidence_provider import EvidenceProviderError
 from app.services.submission import build_submission_export
 
@@ -69,21 +73,23 @@ async def create_session(payload: CreateSessionRequest, db: Session = Depends(ge
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    capture_run_id = str(uuid.uuid4())
     session = ExerciseSession(
         exercise_id=exercise.id,
         student_name=settings_service.get_student_name(db),
         started_at=datetime.now(timezone.utc),
         status=SessionStatus.active,
         student_difficulty=student_difficulty,
+        capture_run_id=capture_run_id,
     )
     db.add(session)
     db.commit()
     db.refresh(session)
 
     try:
-        await get_evidence_provider().start_session(str(session.id))
+        await get_evidence_provider().start_session(capture_run_id)
     except Exception as exc:  # noqa: BLE001 -- capture startup must never block session creation
-        logger.warning("Evidence provider could not start capture for session %s: %s", session.id, exc)
+        logger.warning("Evidence provider could not start capture for session %s (run %s): %s", session.id, capture_run_id, exc)
 
     return session
 
@@ -157,10 +163,11 @@ async def finish_session(session_id: int, db: Session = Depends(get_session)):
 
     session.ended_at = datetime.now(timezone.utc)
 
+    run_id = session.capture_run_id or str(session.id)
     try:
-        await get_evidence_provider().stop_session(str(session.id))
+        await get_evidence_provider().stop_session(run_id)
     except Exception as exc:  # noqa: BLE001 -- must not block finishing/evaluating the session
-        logger.warning("Evidence provider could not stop capture for session %s: %s", session.id, exc)
+        logger.warning("Evidence provider could not stop capture for session %s (run %s): %s", session.id, run_id, exc)
 
     evidence_error: str | None = None
     try:
@@ -170,8 +177,32 @@ async def finish_session(session_id: int, db: Session = Depends(get_session)):
         events = []
         evidence_error = str(exc)
 
+    settings = get_settings()
+    provider = get_evidence_provider()
+    capture_dir = Path(provider.output_dir) / run_id if hasattr(provider, "output_dir") else None
+    manifest: Optional[ManifestWriter] = None
+    if capture_dir is not None:
+        manifest = ManifestWriter(
+            capture_dir=capture_dir,
+            db_session_id=session.id,
+            capture_run_id=run_id,
+            exercise_id=session.exercise_id,
+            provider_name=type(provider).__name__,
+            diagnostics_enabled=getattr(settings, "mentor_diagnostics", False),
+        )
+        manifest.set_session_metadata(
+            started_at=session.started_at,
+            ended_at=session.ended_at,
+            raw_event_count=len(events),
+            normalized_event_count=len(events),
+            available_frames=[
+                {"path": e.frame_path, "timestamp": e.timestamp.isoformat()}
+                for e in events if e.frame_path
+            ],
+        )
+
     result = await get_evaluator_service().evaluate(
-        exercise, events, evidence_error=evidence_error, session_id=str(session.id)
+        exercise, events, evidence_error=evidence_error, session_id=run_id, manifest=manifest
     )
 
     evaluation = Evaluation(

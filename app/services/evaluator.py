@@ -7,12 +7,14 @@ verification, the LLM's opinion is never used to decide pass/fail.
 import base64
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from app.config import BASE_DIR, get_settings
 from app.models.evaluation import Confidence, EvaluationResult, LLMEvaluationInsights, OutcomeResult
 from app.models.exercise import EnvironmentType, Exercise, ExpectedOutcome, OutcomeType
+from app.services.capture_manifest import ManifestWriter
 from app.services.evidence import EvidenceEvent, EvidenceService
 from app.services.ollama import OllamaError, OllamaService
 from app.services.prompts import (
@@ -227,6 +229,7 @@ class EvaluatorService:
         verification: Optional[Dict[str, VerificationDetail]] = None,
         evidence_error: Optional[str] = None,
         session_id: Optional[str] = None,
+        manifest: Optional[ManifestWriter] = None,
     ) -> EvaluationResult:
         if verification is None:
             verification = run_verification(exercise)
@@ -234,7 +237,9 @@ class EvaluatorService:
         if exercise.environment.type == EnvironmentType.terminal:
             events = EvidenceService.filter_terminal_events(events)
 
-        llm_insights = await self._get_llm_insights(exercise, events, verification, evidence_error, session_id)
+        llm_insights = await self._get_llm_insights(
+            exercise, events, verification, evidence_error, session_id, manifest=manifest
+        )
 
         outcomes: List[OutcomeResult] = []
         for step in exercise.get_steps():
@@ -266,6 +271,7 @@ class EvaluatorService:
         verification: Dict[str, VerificationDetail],
         evidence_error: Optional[str] = None,
         session_id: Optional[str] = None,
+        manifest: Optional[ManifestWriter] = None,
     ) -> LLMEvaluationInsights:
         settings = get_settings()
         routing = _select_model(exercise, events, settings)
@@ -273,12 +279,14 @@ class EvaluatorService:
 
         images: List[str] = []
         frame_captions: Optional[str] = None
+        selected_frames: List[SelectedFrame] = []
         if use_vision:
             selected_frames = select_keyframes(events, EVALUATION_MAX_VISION_FRAMES)
             images = _encode_images([sf.path for sf in selected_frames], session_id)
             if not images:
                 use_vision, model = False, settings.ollama_model
                 reason = "screenshots could not be read; falling back to text-only"
+                selected_frames = []
             else:
                 frame_captions = format_frame_captions(selected_frames)
 
@@ -323,6 +331,40 @@ class EvaluatorService:
             context_size,
             str(truncated).lower(),
         )
+
+        # Record evaluation evidence snapshot in manifest before calling the model.
+        model_request_timestamp = datetime.now(timezone.utc).isoformat()
+        if manifest is not None:
+            available_frames = [
+                {
+                    "path": e.frame_path,
+                    "timestamp": e.timestamp.isoformat(),
+                    "application": e.application,
+                }
+                for e in events
+                if e.frame_path
+            ]
+            try:
+                manifest.record_final_evaluation(
+                    model_request_timestamp=model_request_timestamp,
+                    model=model,
+                    routing_reason=reason,
+                    event_count=len(events),
+                    normalized_event_count=len(events),
+                    available_frames=available_frames,
+                    selected_frames=selected_frames,
+                    images_attached=bool(images),
+                    use_vision=use_vision,
+                )
+                if use_vision:
+                    manifest.save_diagnostic_payload(
+                        consumer="final_evaluation",
+                        system_prompt=system_prompt,
+                        user_prompt=prompt,
+                        selected_frames=selected_frames,
+                    )
+            except Exception as exc:  # noqa: BLE001 -- manifest errors must never fail evaluation
+                logger.warning("Evaluation manifest write failed: %s", exc)
 
         try:
             if use_vision:

@@ -141,7 +141,7 @@ class RustCaptureEvidenceProvider(NativeEvidenceProvider):
 
     # -- Stop (platform-specific) -------------------------------------------
 
-    async def stop_session(self, session_id: str) -> None:
+    async def stop_session(self, capture_run_id: str) -> None:
         """Stop the Rust capture process. On macOS, SIGINT (like native_mac);
         on Windows, the explicit `stop --session <id>` subcommand (like
         native_windows, because Win32 asyncio can't deliver SIGINT). After the
@@ -149,21 +149,21 @@ class RustCaptureEvidenceProvider(NativeEvidenceProvider):
         evaluation -- no OCR-task drain is needed (the Rust binary produces its
         own text events).
         """
-        cs = self._sessions.get(session_id)
+        cs = self._sessions.get(capture_run_id)
         if cs is None or cs.process is None:
             return
 
         process = cs.process
 
         if sys.platform == "darwin":
-            await self._stop_via_sigint(process, session_id)
+            await self._stop_via_sigint(process, capture_run_id)
         else:
-            await self._stop_via_command(process, session_id)
+            await self._stop_via_command(process, capture_run_id)
 
         await self._drain_readers(cs)
         logger.info(
-            "native_rust: stopped capture for session %s (%d events collected)",
-            session_id, len(cs.events),
+            "native_rust: stopped capture for run %s (%d events collected)",
+            capture_run_id, len(cs.events),
         )
 
     async def _stop_via_sigint(self, process, session_id: str) -> None:

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.config import BASE_DIR
-from app.services.evidence_provider import EvidenceProvider
+from app.services.evidence_provider import EvidenceProvider, EvidenceProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -150,14 +150,25 @@ class NativeEvidenceProvider(EvidenceProvider):
 
     # -- Session lifecycle (shared) ------------------------------------------
 
-    async def start_session(self, session_id: str) -> None:
-        if session_id in self._sessions:
-            return  # already capturing this session
+    async def start_session(self, capture_run_id: str) -> None:
+        if capture_run_id in self._sessions:
+            return  # already capturing this run
 
+        # The capture directory is named after the immutable capture_run_id so
+        # two sessions that share a numeric DB id (e.g. after a DB reset) can
+        # never write to the same directory.
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        cs = NativeCaptureSession(session_id, self.output_dir / session_id)
-        self._sessions[session_id] = cs
-        self._active_session_id = session_id
+        cs_dir = self.output_dir / capture_run_id
+        if cs_dir.exists():
+            raise EvidenceProviderError(
+                f"Capture directory already exists: {cs_dir}. "
+                f"Each session must have a unique capture_run_id."
+            )
+        cs_dir.mkdir(parents=True)
+
+        cs = NativeCaptureSession(capture_run_id, cs_dir)
+        self._sessions[capture_run_id] = cs
+        self._active_session_id = capture_run_id
 
         if not self.executable.exists():
             cs.error = f"Native capture executable not found at {self.executable}"
@@ -166,7 +177,9 @@ class NativeEvidenceProvider(EvidenceProvider):
 
         try:
             process = await asyncio.create_subprocess_exec(
-                str(self.executable), "start", "--session", session_id, "--output", str(self.output_dir),
+                str(self.executable), "start",
+                "--session", capture_run_id,
+                "--output", str(self.output_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -178,7 +191,7 @@ class NativeEvidenceProvider(EvidenceProvider):
         cs.process = process
         cs.stdout_task = asyncio.create_task(self._read_stdout(cs))
         cs.stderr_task = asyncio.create_task(self._read_stderr(cs))
-        logger.info("%s: started capture for session %s (pid=%s)", self._log_prefix, session_id, process.pid)
+        logger.info("%s: started capture for run %s (pid=%s)", self._log_prefix, capture_run_id, process.pid)
 
     async def _drain_readers(self, cs: NativeCaptureSession) -> None:
         # readline() returns b"" once the process exits and closes its pipes,
@@ -195,10 +208,10 @@ class NativeEvidenceProvider(EvidenceProvider):
             except asyncio.CancelledError:
                 pass
 
-    async def stop_session(self, session_id: str) -> None:
+    async def stop_session(self, capture_run_id: str) -> None:
         # Platform-specific (macOS: SIGINT, Windows: stop command). Subclasses
         # override this and call _drain_readers(cs) once the process has exited.
-        cs = self._sessions.get(session_id)
+        cs = self._sessions.get(capture_run_id)
         if cs is None or cs.process is None:
             return
         await self._drain_readers(cs)
@@ -306,19 +319,23 @@ class NativeEvidenceProvider(EvidenceProvider):
 
     # -- Persisted evidence (historical queries after restart) ---------------
 
-    async def load_persisted_events(self, session_id: str) -> List[Dict[str, Any]]:
+    async def load_persisted_events(self, capture_run_id: str) -> List[Dict[str, Any]]:
         """Read a completed session's events.jsonl back from disk and translate
         each line into the same raw-dict shape EvidenceNormalizer expects --
         reusing the exact same _translate_event the live stdout path uses, so
         persisted evidence normalizes identically to what the evaluator saw at
         finish time.
 
+        capture_run_id is the immutable UUID stored on ExerciseSession. For
+        sessions created before this field was introduced, the caller passes
+        str(session.id) and the file is read from the legacy numeric directory.
+
         This is a read-only historical path; it does not touch capture
         (writing) behavior or the in-memory get_activity/search path used
         during an active session. Returns [] if the file is absent or unreadable
         so callers can fall back to the live provider.
         """
-        path = self.output_dir / session_id / "events.jsonl"
+        path = self.output_dir / capture_run_id / "events.jsonl"
         if not path.exists():
             return []
         items: List[Dict[str, Any]] = []

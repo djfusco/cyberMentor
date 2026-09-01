@@ -34,6 +34,12 @@ class ExerciseSession(SQLModel, table=True):
     # this session only. Never a standing preference; not read for any
     # other session.
     student_difficulty: Optional[DifficultyLevel] = None
+    # Immutable UUID4 string set at session creation. The capture directory
+    # is named after this identifier (capture_sessions/<capture_run_id>/)
+    # so the session permanently references its exact evidence directory
+    # regardless of any DB ID reuse. NULL only for sessions created before
+    # this field was introduced; those sessions fall back to str(id).
+    capture_run_id: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
 
 

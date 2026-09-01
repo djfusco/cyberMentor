@@ -5,6 +5,7 @@ commands on the student's behalf.
 """
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlmodel import Session, select
@@ -12,6 +13,7 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.models.exercise import DifficultyLevel, EnvironmentType, Exercise
 from app.models.session import ExerciseSession, MentorMessage, MentorMessageRole
+from app.services.capture_manifest import ManifestWriter
 from app.services.evidence import EvidenceEvent, EvidenceService
 from app.services.evidence_provider import EvidenceProviderError
 from app.services.evaluator import VISION_NUM_CTX, MAX_VISION_FRAMES, _encode_images
@@ -105,7 +107,10 @@ class MentorService:
         exercise: Exercise,
         question: str,
         help_level: Optional[int] = None,
+        manifest: Optional["ManifestWriter"] = None,
     ) -> str:
+        question_timestamp = datetime.now(timezone.utc).isoformat()
+
         level = exercise.mentor.default_help_level if help_level is None else help_level
         level = max(0, min(5, level))
         if level == 5 and not exercise.mentor.reveal_answer:
@@ -119,8 +124,13 @@ class MentorService:
             events = []
             evidence_error = str(exc)
 
+        # Capture latest event timestamp right after first read, before any filtering.
+        latest_at_read = events[-1].timestamp.isoformat() if events else None
+
         if exercise.environment.type == EnvironmentType.terminal:
             events = EvidenceService.filter_terminal_events(events)
+
+        latest_after_processing = events[-1].timestamp.isoformat() if events else None
 
         verification = run_verification(exercise)
 
@@ -133,12 +143,14 @@ class MentorService:
 
         images: List[str] = []
         frame_captions: Optional[str] = None
+        selected_frames: List = []
         if use_vision:
             selected_frames = select_keyframes(events, MAX_VISION_FRAMES)
             images = _encode_images([sf.path for sf in selected_frames], str(session.id))
             if not images:
                 use_vision, model = False, None
                 reason = "screenshots could not be read; falling back to text-only"
+                selected_frames = []
             else:
                 frame_captions = format_frame_captions(selected_frames)
 
@@ -161,6 +173,52 @@ class MentorService:
             "raw_events=%d screenshots=%d",
             exercise.environment.type.value, model, reason, len(events), len(images),
         )
+
+        # Record evidence snapshot in manifest before sending to the model.
+        model_request_timestamp = datetime.now(timezone.utc).isoformat()
+        if manifest is not None:
+            _INTERACTION_TYPES = frozenset({"mouse_click", "scroll", "app_change", "window_change"})
+            last_interaction = next(
+                (e for e in reversed(events) if e.type in _INTERACTION_TYPES), None
+            )
+            most_recent_interaction: Optional[dict] = None
+            later_frame_exists = False
+            if last_interaction is not None:
+                most_recent_interaction = {
+                    "type": last_interaction.type,
+                    "application": last_interaction.application,
+                    "timestamp": last_interaction.timestamp.isoformat(),
+                }
+                later_frame_exists = any(
+                    e.frame_path
+                    and e.timestamp > last_interaction.timestamp
+                    and e.application == last_interaction.application
+                    for e in events
+                )
+            try:
+                manifest.record_mentor_question(
+                    question=question,
+                    question_timestamp=question_timestamp,
+                    model_request_timestamp=model_request_timestamp,
+                    latest_event_at_read=latest_at_read,
+                    latest_event_after_processing=latest_after_processing,
+                    most_recent_interaction=most_recent_interaction,
+                    later_frame_from_same_app_exists=later_frame_exists,
+                    selected_frames=selected_frames,
+                    images_attached=bool(images),
+                    model=model,
+                    routing_reason=reason,
+                    use_vision=use_vision,
+                )
+                if use_vision:
+                    manifest.save_diagnostic_payload(
+                        consumer="mentor_chat",
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        selected_frames=selected_frames,
+                    )
+            except Exception as exc:  # noqa: BLE001 -- manifest errors must never fail a request
+                logger.warning("Mentor manifest write failed: %s", exc)
 
         db.add(MentorMessage(session_id=session.id, role=MentorMessageRole.student, message=question))
         db.commit()

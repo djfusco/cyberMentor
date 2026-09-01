@@ -91,8 +91,8 @@ class NativeWindowsEvidenceProvider(NativeEvidenceProvider):
 
     # -- Stop (Windows: explicit `stop` command) -----------------------------
 
-    async def stop_session(self, session_id: str) -> None:
-        cs = self._sessions.get(session_id)
+    async def stop_session(self, capture_run_id: str) -> None:
+        cs = self._sessions.get(capture_run_id)
         if cs is None or cs.process is None:
             return
 
@@ -104,24 +104,24 @@ class NativeWindowsEvidenceProvider(NativeEvidenceProvider):
         if process.returncode is None and self.executable.exists():
             try:
                 stop_proc = await asyncio.create_subprocess_exec(
-                    str(self.executable), "stop", "--session", session_id,
+                    str(self.executable), "stop", "--session", capture_run_id,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(stop_proc.communicate(), timeout=_STOP_COMMAND_TIMEOUT_SECONDS)
             except (OSError, asyncio.TimeoutError) as exc:
-                logger.warning("native_windows: stop command failed for session %s: %s", session_id, exc)
+                logger.warning("native_windows: stop command failed for run %s: %s", capture_run_id, exc)
 
         # Wait for the capture process to actually exit after being signaled.
         if process.returncode is None:
             try:
                 await asyncio.wait_for(process.wait(), timeout=_PROCESS_EXIT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
-                logger.warning("native_windows: session %s did not exit after stop, terminating", session_id)
+                logger.warning("native_windows: run %s did not exit after stop, terminating", capture_run_id)
                 try:
                     process.terminate()
                     await asyncio.wait_for(process.wait(), timeout=_TERMINATE_TIMEOUT_SECONDS)
                 except asyncio.TimeoutError:
-                    logger.warning("native_windows: session %s did not terminate, killing", session_id)
+                    logger.warning("native_windows: run %s did not terminate, killing", capture_run_id)
                     try:
                         process.kill()
                         await process.wait()
@@ -131,4 +131,4 @@ class NativeWindowsEvidenceProvider(NativeEvidenceProvider):
                     pass
 
         await self._drain_readers(cs)
-        logger.info("native_windows: stopped capture for session %s (%d events collected)", session_id, len(cs.events))
+        logger.info("native_windows: stopped capture for run %s (%d events collected)", capture_run_id, len(cs.events))
