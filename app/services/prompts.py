@@ -46,6 +46,14 @@ Do not claim the learner performed an action unless the evidence supports it.
 Clearly distinguish between: observed, verified, inferred, and unknown.
 If evidence is insufficient, say so plainly.
 
+When an action is absent from the captured evidence, do NOT state that the
+learner "did not run" the command, "did not perform" the step, "never" did
+something, or that it "was not entered" or "was not observed." Screen capture
+is always incomplete: OCR may miss content, not every screen state is
+captured, and the capture window may not cover all activity. If you cannot
+confirm an action from the available evidence, say "I could not confirm that
+from the available captured evidence" rather than asserting it did not occur.
+
 Do not execute actions for the learner, and do not write out a full command
 solution unless "reveal full solution" is explicitly true below.
 Reveal full solution: {reveal_answer}
@@ -107,6 +115,65 @@ def _truncate_event_text(text: str, application: str, event_type: str) -> Tuple[
     return truncated, True
 
 
+# Number of 'unchanged' lines shown before the first change in each run,
+# to give the model context for where on the screen the new content appeared.
+_DELTA_CONTEXT_LINES: int = 2
+
+
+def _format_text_observed_event(event: EvidenceEvent) -> str:
+    """Format a text_observed event that carries a meaningful line delta.
+
+    Produces a multi-line block clearly labelled as visual screen observation,
+    not shell telemetry.  Only 'added' and 'meaningful_modified' lines are
+    shown; up to _DELTA_CONTEXT_LINES immediately preceding 'unchanged' lines
+    are included before each run of changes so the model can see what
+    surrounded the new content.
+
+    'ocr_jitter' and 'removed' lines are never shown -- they are not new
+    information from the learner's perspective.  The raw .text field is
+    intentionally not shown here; the delta is the communication medium.
+    Returns an empty string if there are no visible changes (should not
+    happen when called correctly, but guards against empty deltas).
+    """
+    delta = event.text_delta
+    if not delta:
+        return ""
+
+    ts_str = event.timestamp.strftime("%H:%M:%S")
+    loc = event.window_title or event.application
+    header = f"[{ts_str}] {event.application} ({loc}) — newly observed on screen"
+
+    output_lines: List[str] = []
+    unchanged_buf: List[str] = []
+    # Tracks whether we have already flushed context for the current run of
+    # changes, so consecutive 'added' lines do not re-emit the same context.
+    context_flushed = False
+
+    for tag, line in delta:
+        if tag == "unchanged":
+            if line.strip():
+                unchanged_buf.append(line)
+            context_flushed = False  # next change block gets fresh context
+        elif tag in ("added", "meaningful_modified"):
+            if not context_flushed and unchanged_buf:
+                for ctx in unchanged_buf[-_DELTA_CONTEXT_LINES:]:
+                    if ctx.strip():
+                        output_lines.append(f"  {ctx}")
+                context_flushed = True
+            unchanged_buf = []
+            prefix = "+" if tag == "added" else "~"
+            if line.strip():
+                output_lines.append(f"{prefix} {line}")
+        else:
+            # 'removed' or 'ocr_jitter': not shown; reset context buffer.
+            unchanged_buf = []
+            context_flushed = False
+
+    if not output_lines:
+        return ""
+    return header + ":\n" + "\n".join(output_lines)
+
+
 def format_evidence_timeline(
     events: List[EvidenceEvent], max_events: int = 40, evidence_error: Optional[str] = None
 ) -> Tuple[str, bool]:
@@ -125,11 +192,28 @@ def format_evidence_timeline(
     lines = []
     truncated_any = False
     for e in recent:
+        if e.type == "text_observed" and e.text_delta is not None:
+            # This event has a meaningful delta -- use the delta-aware format,
+            # which labels content as "newly observed on screen" rather than
+            # dumping the raw OCR blob.
+            formatted = _format_text_observed_event(e)
+            if formatted:
+                lines.append(formatted)
+                continue
+        # Fallback: raw text with existing truncation (first text_observed per
+        # app before a baseline exists, and all non-text_observed event types).
         text, was_truncated = _truncate_event_text(e.text, e.application, e.type)
         truncated_any = truncated_any or was_truncated
         location = f"{e.application} @ {e.browser_url}" if e.browser_url else e.application
         lines.append(f"- [{e.timestamp.isoformat()}] ({location}) {text}")
-    return "\n".join(lines), truncated_any
+    result = "\n".join(lines)
+    if truncated_any:
+        result += (
+            "\n[Note: some captured screen text was truncated to fit available context. "
+            "Absence of a specific action from this timeline does not confirm it was "
+            "not performed -- the full screen content may not have been included.]"
+        )
+    return result, truncated_any
 
 
 def format_verification(verification: Optional[Dict[str, VerificationDetail]]) -> str:
@@ -329,6 +413,14 @@ typed content, and OCR text is frequently garbled. Do NOT conclude a step did
 not happen merely because the text timeline does not explicitly describe it --
 if a screenshot shows the action or its on-screen result, that is sufficient
 evidence it was observed.
+
+When neither the text timeline nor any screenshot directly confirms an action,
+do NOT state that the learner "did not run" the command, "did not perform" the
+step, or "never" did it. Screen capture is always incomplete: OCR may miss
+content, not every screen state is captured, and the capture window may not
+cover all activity. When you cannot confirm an action, write "could not confirm
+from the available captured evidence" and set observed=false -- never assert
+the action did not occur.
 
 STRICT EVIDENCE RULES for every outcome judgment (these prevent false credit):
 - Mark an outcome observed=true ONLY when a screenshot or timeline event

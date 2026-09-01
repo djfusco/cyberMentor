@@ -8,13 +8,28 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.evidence_provider import EvidenceProvider, EvidenceProviderError
 
 logger = logging.getLogger(__name__)
 
 TERMINAL_APP_HINTS = {"terminal", "iterm", "iterm2", "warp", "alacritty", "kitty", "hyper"}
+
+# Each LineChange is (tag, line_text).  Tags:
+#   'unchanged'           line present and identical in both screens
+#   'added'               line present only in new screen (new terminal output)
+#   'removed'             line present only in old screen (scrolled off / cleared)
+#   'meaningful_modified' same line position, content genuinely changed
+#                         (e.g. chmod 600 → chmod 644, Failed → Passed)
+#   'ocr_jitter'          same line position, nearly identical text -- minor
+#                         OCR noise, not a meaningful change
+LineChange = Tuple[str, str]
+
+# SequenceMatcher ratio >= this: treat a replaced-line pair as OCR noise only.
+_OCR_JITTER_THRESHOLD: float = 0.95
+# ratio >= this but below jitter: a real content change on an existing line.
+_MEANINGFUL_MODIFIED_THRESHOLD: float = 0.60
 
 
 @dataclass
@@ -30,6 +45,13 @@ class EvidenceEvent:
     # Preserved so vision-assisted evaluation can look at the actual image
     # instead of only OCR'd text -- see OllamaService.
     frame_path: Optional[str] = None
+    # Derived line-level delta versus the previous text_observed event from
+    # the same application.  Populated during deduplication when at least one
+    # added or meaningful_modified line is detected; None for all other event
+    # types and for the first text_observed from each application (no prior
+    # screen to diff against).  The raw .text field is always the complete
+    # original OCR text -- this field is strictly additive.
+    text_delta: Optional[List[LineChange]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -40,6 +62,11 @@ class EvidenceEvent:
             "browser_url": self.browser_url,
             "window_title": self.window_title,
             "frame_path": self.frame_path,
+            "text_delta": (
+                [{"tag": tag, "text": text} for tag, text in self.text_delta]
+                if self.text_delta is not None
+                else None
+            ),
         }
 
 
@@ -118,6 +145,65 @@ def _extract_optional_str(item: Dict[str, Any], *keys: str) -> Optional[str]:
     return None
 
 
+def _compute_line_delta(old_text: str, new_text: str) -> List[LineChange]:
+    """Compare two consecutive full-screen text_observed captures line by line.
+
+    Uses SequenceMatcher at the line level (autojunk=False so duplicate lines
+    such as repeated shell prompts are not silently suppressed).
+
+    For 'replace' opcodes where block lengths match, each line pair is
+    classified individually by character-level similarity:
+      ratio >= _OCR_JITTER_THRESHOLD  → 'ocr_jitter'   (minor OCR noise)
+      ratio >= _MEANINGFUL_MODIFIED_THRESHOLD → 'meaningful_modified'
+      ratio <  _MEANINGFUL_MODIFIED_THRESHOLD → 'removed' + 'added'
+
+    For unequal-length 'replace' blocks (content too different to pair),
+    all old lines are emitted as 'removed' and all new lines as 'added'.
+    This preserves the newer event's content without making assumptions
+    about which old line corresponds to which new line.
+    """
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    result: List[LineChange] = []
+    matcher = SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for line in new_lines[j1:j2]:
+                result.append(("unchanged", line))
+        elif tag == "insert":
+            for line in new_lines[j1:j2]:
+                result.append(("added", line))
+        elif tag == "delete":
+            for line in old_lines[i1:i2]:
+                result.append(("removed", line))
+        elif tag == "replace":
+            old_block = old_lines[i1:i2]
+            new_block = new_lines[j1:j2]
+            if len(old_block) == len(new_block):
+                for old_l, new_l in zip(old_block, new_block):
+                    ratio = SequenceMatcher(None, old_l, new_l).ratio()
+                    if ratio >= _OCR_JITTER_THRESHOLD:
+                        result.append(("ocr_jitter", new_l))
+                    elif ratio >= _MEANINGFUL_MODIFIED_THRESHOLD:
+                        result.append(("meaningful_modified", new_l))
+                    else:
+                        result.append(("removed", old_l))
+                        result.append(("added", new_l))
+            else:
+                for line in old_block:
+                    result.append(("removed", line))
+                for line in new_block:
+                    result.append(("added", line))
+    return result
+
+
+def _has_meaningful_change(delta: List[LineChange]) -> bool:
+    """Return True when the delta contains at least one 'added' or
+    'meaningful_modified' line -- i.e. the screen shows content the
+    previous capture did not, and the event warrants being emitted."""
+    return any(tag in ("added", "meaningful_modified") for tag, _ in delta)
+
+
 class EvidenceNormalizer:
     def __init__(self, similarity_threshold: float = 0.92):
         self.similarity_threshold = similarity_threshold
@@ -148,38 +234,75 @@ class EvidenceNormalizer:
         return self._deduplicate(events)
 
     def _deduplicate(self, events: List[EvidenceEvent], lookback: int = 3) -> List[EvidenceEvent]:
-        """Collapse near-identical observations from the same app.
+        """Collapse near-duplicate observations using per-type strategies.
 
-        Native capture frequently re-observes the same screen state -- not
-        only in immediately consecutive records, but also a few events
-        later (e.g. a periodic safety-checkpoint screenshot, or a brief
-        switch away and back). Compare each event against the last few
-        *kept* events (not just the immediately preceding one) so those
-        non-consecutive repeats are collapsed too, keeping the longest/most
-        complete text.
+        text_observed events (full-screen OCR dumps):
+            Line-level delta deduplication.  Each event is compared against
+            the most recently seen screen for that application using
+            _compute_line_delta().  An event is emitted only when at least
+            one line is 'added' or 'meaningful_modified'; the event carries
+            the full delta in .text_delta so downstream prompts can show
+            exactly what became newly visible.  The baseline is updated on
+            every event (kept or discarded) so it always tracks the real
+            current screen state.
+
+        All other event types:
+            Whole-text similarity lookback (unchanged from prior behaviour).
+            Their synthesised texts -- "Switched to Terminal", "Clicked at
+            (x, y)", "Keyboard activity: typing x8" -- are short and
+            application-specific, so the character-level SequenceMatcher
+            threshold remains appropriate.
+
+        The old "keep longer text on match" branch is intentionally removed:
+        it was the mechanism by which a post-scroll screen that was shorter
+        than its predecessor caused the prior (longer) text to be retained
+        even when the new screen contained genuinely new bottom lines.
         """
         deduped: List[EvidenceEvent] = []
+        # Per-application baseline for text_observed delta comparison.
+        # Updated on every text_observed event, kept or discarded, so the
+        # delta always measures against the actual current screen state.
+        last_text_by_app: Dict[str, str] = {}
+
         for event in events:
-            match_index: Optional[int] = None
-            for idx in range(len(deduped) - 1, max(-1, len(deduped) - 1 - lookback), -1):
-                candidate = deduped[idx]
-                if candidate.application == event.application and self._is_similar(candidate.text, event.text):
-                    match_index = idx
-                    break
-            if match_index is not None:
-                existing = deduped[match_index]
-                if len(event.text) > len(existing.text):
-                    deduped[match_index] = EvidenceEvent(
-                        timestamp=existing.timestamp,
-                        application=existing.application,
-                        type=existing.type,
-                        text=event.text,
-                        browser_url=event.browser_url or existing.browser_url,
-                        window_title=event.window_title or existing.window_title,
-                        frame_path=event.frame_path or existing.frame_path,
-                    )
-                continue
-            deduped.append(event)
+            if event.type == "text_observed":
+                prev = last_text_by_app.get(event.application)
+                last_text_by_app[event.application] = event.text
+                if prev is None:
+                    # First observation for this app -- no prior screen to
+                    # diff against; emit as-is with no delta.
+                    deduped.append(event)
+                else:
+                    delta = _compute_line_delta(prev, event.text)
+                    if _has_meaningful_change(delta):
+                        deduped.append(
+                            EvidenceEvent(
+                                timestamp=event.timestamp,
+                                application=event.application,
+                                type=event.type,
+                                text=event.text,
+                                browser_url=event.browser_url,
+                                window_title=event.window_title,
+                                frame_path=event.frame_path,
+                                text_delta=delta,
+                            )
+                        )
+                    # No meaningful change (jitter / removed-only / unchanged):
+                    # silently discard.  Baseline was already updated above.
+            else:
+                # Non-text_observed: whole-text lookback deduplication.
+                match_index: Optional[int] = None
+                for idx in range(len(deduped) - 1, max(-1, len(deduped) - 1 - lookback), -1):
+                    candidate = deduped[idx]
+                    if (
+                        candidate.application == event.application
+                        and self._is_similar(candidate.text, event.text)
+                    ):
+                        match_index = idx
+                        break
+                if match_index is None:
+                    deduped.append(event)
+                # else: discard identical non-text event.
         return deduped
 
     def _is_similar(self, a: str, b: str) -> bool:
