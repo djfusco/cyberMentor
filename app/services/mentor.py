@@ -14,7 +14,8 @@ from app.models.exercise import DifficultyLevel, EnvironmentType, Exercise
 from app.models.session import ExerciseSession, MentorMessage, MentorMessageRole
 from app.services.evidence import EvidenceEvent, EvidenceService
 from app.services.evidence_provider import EvidenceProviderError
-from app.services.evaluator import VISION_NUM_CTX, _encode_images, _select_frame_paths
+from app.services.evaluator import VISION_NUM_CTX, MAX_VISION_FRAMES, _encode_images
+from app.services.keyframes import format_frame_captions, select_keyframes
 from app.services.ollama import OllamaError, OllamaService
 from app.services.prompts import build_mentor_system_prompt, build_mentor_user_prompt
 from app.services.token_budget import fit_to_budget
@@ -81,7 +82,7 @@ def _route_mentor_model(
         )
     if not settings.ollama_vision_model:
         return _MentorModelRouting(None, False, "vision model not configured")
-    if not _select_frame_paths(events):
+    if not any(e.frame_path for e in events):
         return _MentorModelRouting(
             None, False, "no screenshots captured for this session"
         )
@@ -131,18 +132,22 @@ class MentorService:
         use_vision, model, reason = routing.use_vision, routing.model, routing.reason
 
         images: List[str] = []
+        frame_captions: Optional[str] = None
         if use_vision:
-            images = _encode_images(_select_frame_paths(events), str(session.id))
+            selected_frames = select_keyframes(events, MAX_VISION_FRAMES)
+            images = _encode_images([sf.path for sf in selected_frames], str(session.id))
             if not images:
                 use_vision, model = False, None
                 reason = "screenshots could not be read; falling back to text-only"
+            else:
+                frame_captions = format_frame_captions(selected_frames)
 
         context_size = VISION_NUM_CTX if use_vision else settings.ollama_model_num_ctx
 
         def render(count: int):
             prompt, truncated = build_mentor_user_prompt(
                 exercise, events, verification, question, evidence_error,
-                has_images=use_vision, max_events=count,
+                has_images=use_vision, frame_captions=frame_captions, max_events=count,
             )
             return system_prompt, prompt, truncated
 

@@ -283,6 +283,7 @@ def build_mentor_user_prompt(
     question: str,
     evidence_error: Optional[str] = None,
     has_images: bool = False,
+    frame_captions: Optional[str] = None,
     max_events: int = 40,
 ) -> Tuple[str, bool]:
     outcomes = format_outcomes_by_step(exercise)
@@ -298,6 +299,8 @@ def build_mentor_user_prompt(
         if has_images
         else ""
     )
+    if has_images and frame_captions:
+        image_note += frame_captions + "\n"
     prompt = f"""Exercise: {exercise.title}
 {image_note}
 Instructions:
@@ -367,6 +370,7 @@ def build_session_query_user_prompt(
     question: str,
     evidence_error: Optional[str] = None,
     has_images: bool = False,
+    frame_captions: Optional[str] = None,
     max_events: int = 80,
 ) -> Tuple[str, bool]:
     timeline, truncated = format_evidence_timeline(
@@ -381,6 +385,8 @@ def build_session_query_user_prompt(
         if has_images
         else ""
     )
+    if has_images and frame_captions:
+        image_note += frame_captions + "\n"
     prompt = f"""Session: {session_title} (session id {session_id})
 {image_note}
 The user asks: "{question}"
@@ -488,6 +494,7 @@ def build_evaluation_user_prompt(
     verification: Optional[dict],
     evidence_error: Optional[str] = None,
     has_images: bool = False,
+    frame_captions: Optional[str] = None,
     max_events: int = 80,
 ) -> Tuple[str, bool]:
     outcomes = format_outcomes_by_step(exercise)
@@ -504,6 +511,8 @@ def build_evaluation_user_prompt(
         if has_images
         else ""
     )
+    if has_images and frame_captions:
+        image_note += frame_captions + "\n"
     timeline, truncated = format_evidence_timeline(events, max_events=max_events, evidence_error=evidence_error)
     if evidence_error:
         closing = (
@@ -555,6 +564,7 @@ def build_missing_judgments_prompt(
     events: List[EvidenceEvent],
     missing_ids: List[str],
     has_images: bool = False,
+    frame_captions: Optional[str] = None,
     max_events: int = 80,
 ) -> Tuple[str, bool]:
     """A focused follow-up prompt used when the first evaluation returned a
@@ -580,6 +590,8 @@ def build_missing_judgments_prompt(
         if has_images
         else ""
     )
+    if has_images and frame_captions:
+        image_note += frame_captions + "\n"
     timeline, truncated = format_evidence_timeline(events, max_events=max_events)
     prompt = f"""Your previous evaluation of this session did not include a judgment for every
 required outcome id. You MUST now provide a judgment for EACH of the outcome ids

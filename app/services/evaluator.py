@@ -20,6 +20,7 @@ from app.services.prompts import (
     build_evaluation_user_prompt,
     build_missing_judgments_prompt,
 )
+from app.services.keyframes import SelectedFrame, format_frame_captions, select_keyframes
 from app.services.token_budget import fit_to_budget
 from app.services.verifier import VerificationDetail, run_verification
 
@@ -206,7 +207,7 @@ def _select_model(exercise: Exercise, events: List[EvidenceEvent], settings) -> 
         )
     if not settings.ollama_vision_model:
         return _ModelRouting(settings.ollama_model, False, "vision model not configured")
-    if not _select_frame_paths(events):
+    if not any(e.frame_path for e in events):
         return _ModelRouting(settings.ollama_model, False, "no screenshots captured for this session")
     return _ModelRouting(
         settings.ollama_vision_model,
@@ -271,13 +272,15 @@ class EvaluatorService:
         use_vision, model, reason = routing.use_vision, routing.model, routing.reason
 
         images: List[str] = []
+        frame_captions: Optional[str] = None
         if use_vision:
-            # Spread frames across the WHOLE session (not just the most recent)
-            # so every phase of the work is visible -- see _select_spread_frame_paths.
-            images = _encode_images(_select_spread_frame_paths(events), session_id)
+            selected_frames = select_keyframes(events, EVALUATION_MAX_VISION_FRAMES)
+            images = _encode_images([sf.path for sf in selected_frames], session_id)
             if not images:
                 use_vision, model = False, settings.ollama_model
                 reason = "screenshots could not be read; falling back to text-only"
+            else:
+                frame_captions = format_frame_captions(selected_frames)
 
         context_size = VISION_NUM_CTX if use_vision else settings.ollama_model_num_ctx
         # Vision evaluation attaches up to 8 screenshots and asks for a large
@@ -289,7 +292,8 @@ class EvaluatorService:
 
         def render(count: int):
             prompt, per_event_truncated = build_evaluation_user_prompt(
-                exercise, events, verification, evidence_error, has_images=use_vision, max_events=count
+                exercise, events, verification, evidence_error,
+                has_images=use_vision, frame_captions=frame_captions, max_events=count,
             )
             return EVALUATION_SYSTEM_PROMPT, prompt, per_event_truncated
 
@@ -363,6 +367,7 @@ class EvaluatorService:
                 insights = await self._fill_missing_judgments(
                     insights, exercise, events, missing_ids,
                     images=images if use_vision else None,
+                    frame_captions=frame_captions,
                     model=model, num_ctx=context_size, timeout=eval_timeout,
                 )
 
@@ -375,6 +380,7 @@ class EvaluatorService:
         events: List[EvidenceEvent],
         missing_ids: List[str],
         images: Optional[List[str]] = None,
+        frame_captions: Optional[str] = None,
         model: Optional[str] = None,
         num_ctx: Optional[int] = None,
         timeout: Optional[float] = None,
@@ -385,7 +391,8 @@ class EvaluatorService:
         (filling gaps; never overwriting a judgment the first call did return).
         """
         focused_prompt, _truncated = build_missing_judgments_prompt(
-            exercise, events, missing_ids, has_images=images is not None,
+            exercise, events, missing_ids,
+            has_images=images is not None, frame_captions=frame_captions,
         )
         logger.info(
             "Evaluation follow-up for %d missing outcome judgment(s): %s",
