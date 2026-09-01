@@ -117,7 +117,12 @@ class GenericDeclarativeVerifier:
 
     def verify(self, exercise: Exercise) -> Dict[str, VerificationDetail]:
         results: Dict[str, VerificationDetail] = {}
-        for outcome in exercise.expected_outcomes:
+        # Exercise.get_all_outcomes() normalizes both single-task
+        # (expected_outcomes) and multi-step (steps[].expected_outcomes)
+        # exercises -- reading expected_outcomes directly here would silently
+        # skip every outcome of a multi-step exercise, since steps and
+        # expected_outcomes are mutually exclusive (see Exercise model_validator).
+        for outcome in exercise.get_all_outcomes():
             if outcome.type != OutcomeType.filesystem or outcome.check is None:
                 continue
             results[outcome.id] = self._run_check(outcome.check)

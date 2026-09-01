@@ -215,19 +215,6 @@ def _select_model(exercise: Exercise, events: List[EvidenceEvent], settings) -> 
     )
 
 
-# Supplementary confidence booster only -- not the primary scoring mechanism.
-# Literal verification commands seen in evidence bump an already-positive LLM
-# judgment from `inferred` to `strongly_observed`, but a missing keyword never
-# fails an outcome by itself (that would only work for terminal exercises).
-VERIFICATION_KEYWORDS = ["ls -l", "ls -la", "ls -al", "stat ", "getfacl", "namei -l"]
-
-
-def _evidence_mentions_verification(events: List[EvidenceEvent]) -> bool:
-    return any(
-        keyword in event.text.lower() for event in events for keyword in VERIFICATION_KEYWORDS
-    )
-
-
 class EvaluatorService:
     def __init__(self, ollama: OllamaService):
         self.ollama = ollama
@@ -465,20 +452,6 @@ class EvaluatorService:
             )
 
         judgment = next((j for j in llm_insights.outcome_judgments if j.id == outcome.id), None)
-
-        # A literal verification-style command in evidence is a strong, standalone
-        # signal -- checked first regardless of whether the LLM also judged this
-        # outcome, mirroring how deterministic evidence should outrank inference.
-        if _evidence_mentions_verification(events):
-            return OutcomeResult(
-                id=outcome.id,
-                passed=True,
-                score=outcome.weight,
-                max_score=outcome.weight,
-                confidence=Confidence.strongly_observed,
-                evidence=(judgment.evidence if judgment and judgment.observed else None)
-                or "Observed a verification command in captured activity.",
-            )
 
         if judgment is not None and judgment.observed:
             # Screenshots are the primary source of truth for visual exercises
