@@ -1,0 +1,91 @@
+id: ssh-failed-login-investigation
+title: Investigating Failed SSH Logins
+description: A Linux server shows signs of unusual SSH activity. The learner must
+  analyze the auth.log file to identify failed login attempts, count them by source
+  IP, and determine which IP is most likely responsible for suspicious behavior.
+instructions: 'Using terminal commands, inspect the auth.log file to:
+
+  1. Locate failed SSH login attempts.
+
+  2. Extract the source IP addresses associated with those failures.
+
+  3. Count how many failed attempts came from each IP.
+
+  4. Identify the IP address with the highest number of failed attempts.
+
+  5. Explain why this pattern suggests suspicious (e.g., brute-force) activity.'
+environment:
+  type: terminal
+difficulty: intermediate
+expected_outcomes: []
+steps:
+- id: identify_failed_logins
+  title: Identify Failed SSH Login Attempts
+  instructions: Filter the auth.log file to display only lines containing failed SSH
+    login attempts (i.e., lines with 'Failed password').
+  expected_outcomes:
+  - id: step1_filter_failed
+    description: Learner successfully filters lines containing 'Failed password' from
+      auth.log.
+    type: observed_behavior
+    weight: 30.0
+    check: null
+- id: extract_and_count_ips
+  title: Extract Source IPs and Count Attempts
+  instructions: Extract the source IP addresses from the failed login lines (the IP
+    appears immediately after the word 'from'), count how many failures came from
+    each IP, and sort the results in descending order by count.
+  expected_outcomes:
+  - id: step2_extract_ip
+    description: Learner correctly extracts the IP address following 'from' in each
+      failed line.
+    type: observed_behavior
+    weight: 20.0
+    check: null
+  - id: step2_count_by_ip
+    description: Learner counts failed attempts per IP and sorts them in descending
+      order.
+    type: observed_behavior
+    weight: 25.0
+    check: null
+- id: identify_suspicious_ip
+  title: Identify Suspicious IP and Explain
+  instructions: Identify the IP address with the highest number of failed attempts
+    and explain why this pattern suggests brute-force activity.
+  expected_outcomes:
+  - id: step3_top_ip
+    description: Learner correctly identifies 192.168.1.77 as the IP with the most
+      failed attempts (15).
+    type: observed_behavior
+    weight: 15.0
+    check: null
+  - id: step3_explanation
+    description: Learner explains that repeated failed login attempts from a single
+      IP suggest brute-force behavior.
+    type: observed_behavior
+    weight: 10.0
+    check: null
+acceptable_methods:
+- grep
+- awk
+- sed
+- cut
+- sort
+- uniq
+- head
+- tail
+- less
+- cat
+- python
+- perl
+prohibited_behaviors:
+- Hard-coding the answer without evidence from the log
+- Using GUI tools or external analysis unless explicitly permitted
+mentor:
+  allow_questions: true
+  default_help_level: 2
+  reveal_answer: false
+signing_key: d1f744178d4a07c62d6ce5de45f7bcff
+author: null
+created_at: '2026-09-01T20:45:56.141084Z'
+sources: []

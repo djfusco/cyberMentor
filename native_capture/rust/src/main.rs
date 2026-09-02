@@ -21,6 +21,7 @@ mod events;
 mod input;
 mod ocr;
 mod self_capture;
+mod status_bar;
 mod stop;
 
 // Windows-only module: Win32 foreground-window tracking (GetForegroundWindow,
@@ -258,6 +259,9 @@ fn run_start(args: &[String]) -> i32 {
         Some(pair) => (Some(pair.0), Some(pair.1)),
         None => (None, None),
     };
+
+    // Show a "● Recording" indicator in the macOS menu bar for the session.
+    let _status_bar = status_bar::StatusBarGuard::new();
 
     // Run the capture loop.
     let result = capture_loop(
