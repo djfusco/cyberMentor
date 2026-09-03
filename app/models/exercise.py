@@ -10,6 +10,15 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
+class VerificationState(str, Enum):
+    not_observed       = "not_observed"
+    attempted          = "attempted"
+    partially_verified = "partially_verified"
+    verified           = "verified"
+    incorrect          = "incorrect"
+    unverifiable       = "unverifiable"
+
+
 class OutcomeType(str, Enum):
     filesystem = "filesystem"
     observed_behavior = "observed_behavior"
@@ -38,12 +47,34 @@ class CheckSpec(BaseModel):
     pattern: Optional[str] = None
 
 
+class LearningObjective(BaseModel):
+    id: str
+    description: str
+    measurable_skills: List[str] = Field(default_factory=list)
+
+
 class ExpectedOutcome(BaseModel):
     id: str
     description: str
     type: OutcomeType
     weight: float
     check: Optional[CheckSpec] = None
+    # additive fields — safe defaults for backward compat
+    objective_ids: List[str] = Field(default_factory=list)
+    success_criteria: List[str] = Field(default_factory=list)
+    evidence_requirements: List[str] = Field(default_factory=list)
+    scoring_rubric: Optional[str] = None
+    feedback_if_missing: Optional[str] = None
+
+    def get_success_criteria(self) -> List[str]:
+        """Explicit criteria if authored; description as single implicit fallback.
+        Never invents criteria beyond what the author provided."""
+        return self.success_criteria if self.success_criteria else [self.description]
+
+    @property
+    def has_explicit_criteria(self) -> bool:
+        """True when success_criteria were explicitly authored (not derived from description)."""
+        return bool(self.success_criteria)
 
 
 class EnvironmentType(str, Enum):
@@ -138,6 +169,7 @@ class Exercise(BaseModel):
     acceptable_methods: List[str] = Field(default_factory=list)
     prohibited_behaviors: List[str] = Field(default_factory=list)
     mentor: MentorConfig = Field(default_factory=MentorConfig)
+    learning_objectives: List[LearningObjective] = Field(default_factory=list)
     # Present on exercises authored via the chat flow (app/services/exercise_author.py).
     # Used as the HMAC key when signing/verifying submission exports -- see
     # app/services/submission.py. Absent on hand-written exercises, in which

@@ -2,7 +2,7 @@
 import logging
 from typing import Dict, List, Optional, Tuple
 
-from app.models.exercise import Exercise
+from app.models.exercise import Exercise, LearningObjective
 from app.services.evidence import EvidenceEvent
 from app.services.verifier import VerificationDetail
 
@@ -273,12 +273,15 @@ def build_mentor_system_prompt(
     difficulty_instructions = DIFFICULTY_ASSISTANCE_INSTRUCTIONS.get(
         effective_difficulty, DIFFICULTY_ASSISTANCE_INSTRUCTIONS["intermediate"]
     )
-    return MENTOR_SYSTEM_PROMPT_TEMPLATE.format(
+    prompt = MENTOR_SYSTEM_PROMPT_TEMPLATE.format(
         help_level=help_level,
         help_level_description=description,
         reveal_answer=reveal_answer,
         difficulty_instructions=difficulty_instructions,
     )
+    if _exercise_is_enriched(exercise):
+        prompt += ENRICHED_MENTOR_ADDENDUM
+    return prompt
 
 
 def build_mentor_user_prompt(
@@ -291,7 +294,7 @@ def build_mentor_user_prompt(
     frame_captions: Optional[str] = None,
     max_events: int = 40,
 ) -> Tuple[str, bool]:
-    outcomes = format_outcomes_by_step(exercise)
+    outcomes = format_outcomes_for_mentor(exercise)
     timeline, truncated = format_evidence_timeline(events, max_events=max_events, evidence_error=evidence_error)
     image_note = (
         "\nScreenshots of the learner's screen are attached to this message. They are "
@@ -410,6 +413,134 @@ insufficient to answer reliably, say so plainly rather than guessing.
     return prompt, truncated
 
 
+def _exercise_is_enriched(exercise: Exercise) -> bool:
+    """True when any outcome carries explicit success criteria.
+    LOs alone are not sufficient — enrichment is measured at the outcome level."""
+    return any(o.has_explicit_criteria for o in exercise.get_all_outcomes())
+
+
+def format_outcomes_for_evaluation(exercise: Exercise) -> str:
+    """Per-outcome structured blocks for the evaluator prompt.
+    Enriched outcomes get full criteria/evidence sections;
+    legacy outcomes get a compact implicit-criterion block.
+    Multi-step exercises include a step header with instructions before each group."""
+    blocks: List[str] = []
+    sep = "─" * 57
+    is_multi_step = exercise.steps is not None
+    for step in exercise.get_steps():
+        if is_multi_step:
+            step_header = f"Step '{step.title}':"
+            if step.instructions:
+                step_header += f"\n  Instructions: {step.instructions}"
+            blocks.append(step_header)
+        for outcome in step.expected_outcomes:
+            lines = [sep, f"OUTCOME: {outcome.id}"]
+            lo_str = ", ".join(outcome.objective_ids) if outcome.objective_ids else ""
+            weight_line = f"Weight: {outcome.weight} pts | Type: {outcome.type.value}"
+            if lo_str:
+                weight_line += f" | LOs: {lo_str}"
+            lines.append(weight_line)
+
+            if outcome.has_explicit_criteria:
+                lines.append("Criteria source: [explicitly authored]")
+                lines.append("")
+                lines.append("Success criteria — evaluate EACH independently:")
+                for i, c in enumerate(outcome.success_criteria, 1):
+                    lines.append(f"  {i}. {c}")
+                if outcome.evidence_requirements:
+                    lines.append("")
+                    lines.append("Evidence to look for (semantic, not UI-specific):")
+                    for r in outcome.evidence_requirements:
+                        lines.append(f"  - {r}")
+                if outcome.feedback_if_missing:
+                    lines.append("")
+                    lines.append("Instructor guidance if not completed:")
+                    lines.append(f"  {outcome.feedback_if_missing}")
+            else:
+                lines.append("Criteria source: [derived from description — no explicit criteria authored]")
+                lines.append("")
+                lines.append("Implicit criterion:")
+                lines.append(f"  - {outcome.description}")
+                lines.append("")
+                lines.append("Note: Assess against the single implicit criterion only.")
+                lines.append("Do not invent additional sub-criteria.")
+
+            lines.append(sep)
+            blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
+def format_outcomes_for_mentor(exercise: Exercise) -> str:
+    """Outcome context for the mentor prompt.
+    Includes LO header when present; enriched outcomes show criteria and
+    evidence; legacy outcomes use the existing compact format unchanged."""
+    result_parts: List[str] = []
+
+    if exercise.learning_objectives:
+        lo_lines = ["Learning objectives for this exercise:"]
+        for lo in exercise.learning_objectives:
+            lo_lines.append(f"  {lo.id}: {lo.description}")
+        result_parts.append("\n".join(lo_lines))
+
+    steps = exercise.get_steps()
+    is_multi_step = exercise.steps is not None
+
+    for step in steps:
+        outcome_lines: List[str] = []
+        for outcome in step.expected_outcomes:
+            lo_str = f" · {', '.join(outcome.objective_ids)}" if outcome.objective_ids else ""
+            header = f"- {outcome.id} ({outcome.weight} pts{lo_str}): {outcome.description}"
+            outcome_lines.append(header)
+
+            if outcome.has_explicit_criteria:
+                outcome_lines.append("  What success looks like:")
+                for c in outcome.success_criteria:
+                    outcome_lines.append(f"    • {c}")
+                if outcome.evidence_requirements:
+                    outcome_lines.append("  Evidence to look for:")
+                    for r in outcome.evidence_requirements:
+                        outcome_lines.append(f"    • {r}")
+                if outcome.feedback_if_missing:
+                    outcome_lines.append(
+                        f"  [Instructor note if not completed: {outcome.feedback_if_missing}]"
+                    )
+
+        step_block = "\n".join(outcome_lines)
+        if is_multi_step:
+            step_header = f"Step '{step.title}':"
+            if step.instructions:
+                step_header += f"\n{step.instructions}"
+            result_parts.append(f"{step_header}\n{step_block}")
+        else:
+            result_parts.append(step_block)
+
+    return "\n\n".join(result_parts)
+
+
+ENRICHED_MENTOR_ADDENDUM = """
+When success criteria are listed for an expected outcome, use them internally
+to understand what the learner still needs to demonstrate.
+- If the student asks "am I doing this right?", "what am I missing?", "is this complete?",
+  or a similar status question, compare the observed evidence to the relevant criteria explicitly.
+- Otherwise, answer the student's actual question. Do not turn every response into a criteria checklist.
+
+When describing evidence state, use language that matches what you actually know:
+- "I can confirm..." — when evidence affirmatively supports something
+- "I can see evidence that..." — when evidence strongly suggests something
+- "I can't confirm yet..." — when evidence is absent or ambiguous
+- "The evidence suggests..." — for inferences
+- "This appears to..." — for partial support
+
+Never convert absence of evidence into evidence of failure. These are three distinct situations:
+A. Affirmative evidence of an error: state it directly.
+B. Evidence shows partial progress: acknowledge what is confirmed.
+C. Evidence is absent or ambiguous: say you cannot confirm yet, not that it failed.
+
+Instructor notes on outcomes are background guidance. Adapt the content to the
+learner's evidence state and difficulty level; do not quote them verbatim.
+"""
+
+
 EVALUATION_SYSTEM_PROMPT = """You are an AI evaluator analyzing how a learner approached a technical
 exercise, using observed screen activity as evidence. The exercise may be a
 single task or a sequence of steps in one or more applications (terminal,
@@ -482,6 +613,29 @@ REPORT FIELD RULES (applied when populating the JSON fields below):
   ("it was not possible to confirm", "could not be verified from the
   available evidence", "may need attention").
 
+VERIFICATION STATE RULES — must be consistent with criteria assessment:
+- verified: all required success criteria are supported by sufficient evidence.
+  Do NOT use verified if any required criterion is unsatisfied.
+- partially_verified: at least one criterion is supported, but one or more are not.
+- attempted: affirmative evidence of meaningful engagement, but no criterion is
+  sufficiently supported.
+- incorrect: affirmative evidence the task/result is wrong. Do NOT use merely
+  because evidence is absent.
+- not_observed: the task should have been observable but relevant evidence was absent.
+- unverifiable: the capture mechanism cannot reliably determine completion.
+
+THREE INDEPENDENT DIMENSIONS — do not conflate them:
+- verification_state: what the evidence establishes about completion
+- confidence: how certain you are about that assessment
+- observed / score: credit under the exercise's scoring rules
+A partially_verified outcome may still receive passing credit if the rubric allows it.
+verified must not be used merely because an outcome received passing credit.
+
+For outcomes with "Criteria source: [derived from description]", assess only the
+single implicit criterion. Do not invent additional sub-criteria.
+For enriched outcomes, verification_state is REQUIRED. For legacy outcomes, provide
+it when determinable; omit only when genuinely uncertain.
+
 Respond with ONLY a single JSON object, no prose before or after, and no
 markdown code fences, matching exactly this schema:
 
@@ -494,9 +648,14 @@ markdown code fences, matching exactly this schema:
   "risky_or_unnecessary_steps": ["string", ...],
   "outcome_judgments": [
     {
-      "id": "the exact outcome id being judged",
+      "id": "the exact outcome id",
+      "verification_state": "verified | partially_verified | attempted | not_observed | incorrect | unverifiable",
+      "criteria_met": ["criterion text that is supported by evidence"],
+      "criteria_not_met": ["criterion text that is not supported"],
       "observed": true,
-      "evidence": "string describing what in the activity timeline supports this judgment"
+      "confidence": "verified | strongly_observed | inferred | unknown",
+      "evidence": "string describing what in the activity supports this judgment",
+      "feedback": "concise student-facing note when the outcome fails or is partial, or null"
     }
   ]
 }
@@ -517,7 +676,7 @@ def build_evaluation_user_prompt(
     frame_captions: Optional[str] = None,
     max_events: int = 80,
 ) -> Tuple[str, bool]:
-    outcomes = format_outcomes_by_step(exercise)
+    outcomes = format_outcomes_for_evaluation(exercise)
     acceptable = "\n".join(f"- {m}" for m in exercise.acceptable_methods) or "(none specified)"
     prohibited = "\n".join(f"- {m}" for m in exercise.prohibited_behaviors) or "(none specified)"
     image_note = (

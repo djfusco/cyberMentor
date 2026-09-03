@@ -1,0 +1,374 @@
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p1_data_ingestion' has 4 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p1_exploratory_analysis' has 3 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p1_data_integrity' has 3 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p1_summary_table' has 2 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p2_exfiltration_detection' has 3 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p2_port_scan_detection' has 4 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p2_high_risk_service_exploitation' has 4 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p3_dashboard_panels' has 6 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p3_drilldown_functionality' has 3 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p3_usage_guide' has 3 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p4_c2_scoring_implementation' has 3 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+# WARNING:   • [no_partial_credit_rubric] Outcome 'p4_c2_investigation_analysis' has 4 independent criteria but no scoring_rubric. Consider specifying how partial credit is awarded.
+id: splunk-network-security-analytics
+title: Network Security Analytics with Splunk
+description: Students configure Splunk Enterprise locally, ingest a labeled network
+  traffic dataset, perform statistical threat detection (data exfiltration, port scanning,
+  high-risk service exploitation), build a 5-panel security dashboard with drilldown,
+  and conduct a hypothesis-driven C2 threat hunt using behavioral scoring.
+instructions: 'Complete four parts: (1) Install Splunk Enterprise, upload network_traffic_flows.csv,
+  and verify data integrity via exploratory queries; (2) Use SPL to detect data exfiltration,
+  port scanning, and high-risk service exploitation using explicit thresholds; (3)
+  Build a 5-panel Classic Dashboard with drilldown; (4) Conduct a hypothesis-driven
+  C2 hunt using the provided behavioral scoring logic. Submit screenshots of SPL queries,
+  dashboard, and analysis tables as evidence.'
+environment:
+  type: terminal
+difficulty: intermediate
+expected_outcomes: []
+steps:
+- id: part_1_splunk_setup_and_data_preparation
+  title: 'Part 1: Splunk Setup & Data Preparation'
+  instructions: Install Splunk Enterprise (60-day trial), create index 'network_traffic',
+    upload network_traffic_flows.csv with sourcetype 'csv', and run exploratory queries
+    to verify data integrity and generate baseline statistics.
+  expected_outcomes:
+  - id: p1_data_ingestion
+    description: Verify Splunk index creation, data upload, and event count integrity
+    type: observed_behavior
+    weight: 3.0
+    check: null
+    objective_ids:
+    - LO1
+    success_criteria:
+    - Index 'network_traffic' exists and is selected as default search scope
+    - Sourcetype is correctly set to 'csv'
+    - Total event count matches file line count minus header (e.g., 10,000 rows)
+    - Search returns at least one event with expected fields (ip_src, ip_dst, totalSourceBytes,
+      Tag)
+    evidence_requirements:
+    - "Screenshot showing Settings \u2192 Indexes with 'network_traffic' listed"
+    - "Screenshot of Add Data \u2192 Upload confirmation screen"
+    - Screenshot of a search (e.g., index=network_traffic | head 1) returning data
+      with required fields
+    scoring_rubric: null
+    feedback_if_missing: "You've uploaded the file, but the index isn't named 'network_traffic'\
+      \ \u2014 Splunk defaults to 'main'. Re-upload and explicitly set the index name.\
+      \ Also verify sourcetype is 'csv' (not 'auto') to preserve field extraction."
+  - id: p1_exploratory_analysis
+    description: 'Generate baseline statistics: unique IPs, protocols, apps, and Tag
+      distribution'
+    type: observed_behavior
+    weight: 4.0
+    check: null
+    objective_ids:
+    - LO1
+    success_criteria:
+    - Query returns unique counts of source IPs, destination IPs, protocols, applications,
+      and tags
+    - Query returns counts by Tag (attack vs. normal)
+    - Results are presented in a structured table (not just raw events)
+    evidence_requirements:
+    - 'Screenshot of SPL query: index=network_traffic | stats dc(ip_src) dc(ip_dst)
+      dc(protocol) dc(app) by Tag'
+    - 'Screenshot of SPL query: index=network_traffic | stats count by Tag'
+    - Table columns clearly labeled (e.g., Tag, dc(ip_src), count)
+    scoring_rubric: null
+    feedback_if_missing: "You ran | stats count but didn't break down by Tag or unique\
+      \ fields. The rubric requires comparative baseline stats \u2014 e.g., how many\
+      \ unique sources per tag? Re-run with dc() and by Tag."
+  - id: p1_data_integrity
+    description: Verify Tag field completeness and validity (no missing/malformed
+      values)
+    type: observed_behavior
+    weight: 4.0
+    check: null
+    objective_ids:
+    - LO1
+    success_criteria:
+    - No missing Tag values (Tag=* returns 0 events)
+    - All Tag values are either 'attack' or 'normal' (case-insensitive match)
+    - No syntax errors in SPL (e.g., unmatched quotes, invalid field names)
+    evidence_requirements:
+    - "Screenshot of: index=network_traffic Tag=* \u2192 returns 0 results"
+    - "Screenshot of: index=network_traffic | stats count by Tag \u2192 only two rows:\
+      \ 'attack', 'normal'"
+    - "Optional: | where isnull(Tag) \u2192 0 results"
+    scoring_rubric: null
+    feedback_if_missing: "Your Tag=* search returned events \u2014 this suggests missing\
+      \ or malformed tags (e.g., empty strings, extra spaces). Check for leading/trailing\
+      \ whitespace: try | eval Tag=lower(trim(Tag)) before counting."
+  - id: p1_summary_table
+    description: Produce a single-row summary table with total events, unique IPs,
+      protocols, and Tag split
+    type: observed_behavior
+    weight: 4.0
+    check: null
+    objective_ids:
+    - LO1
+    success_criteria:
+    - 'Table includes: total events, unique source IPs, unique destination IPs, protocol
+      counts (TCP/UDP/ICMP), attack vs. normal split'
+    - Values are consistent across queries (e.g., count matches | stats count)
+    evidence_requirements:
+    - Screenshot of a formatted table (e.g., using | rename, | fields, or | table)
+      summarizing key stats
+    - Values match those from exploratory analysis (Outcome 1.2)
+    scoring_rubric: null
+    feedback_if_missing: "Your table is missing protocol breakdowns or Tag split.\
+      \ Also, ensure you\u2019re using count(eval(...)) for conditional counts \u2014\
+      \ not just | stats count by protocol \u2014 since the rubric expects a single-row\
+      \ summary."
+- id: part_2_statistical_threat_detection
+  title: 'Part 2: Statistical Threat Detection'
+  instructions: 'Use SPL to detect data exfiltration (via volume thresholds: avg +
+    2*stdev of totalSourceBytes, or >1MB, or >3 transfers), port scanning (5-minute
+    bins, port diversity analysis), and high-risk service exploitation (ports 21,22,23,135,139,445,3389,5900,8080).
+    Document methodology and findings.'
+  expected_outcomes:
+  - id: p2_exfiltration_detection
+    description: Detect data exfiltration using volume-based thresholds and statistical
+      analysis
+    type: observed_behavior
+    weight: 12.0
+    check: null
+    objective_ids:
+    - LO2
+    success_criteria:
+    - 'Uses explicit thresholds: avg + 2*stdev of totalSourceBytes, or >1MB, or >3
+      transfers per source'
+    - Identifies top exfiltration sources with supporting SPL
+    - Results include both statistical and absolute thresholds
+    evidence_requirements:
+    - Screenshot of SPL query implementing exfiltration detection logic
+    - Screenshot of results table showing top exfiltration sources with counts/volumes
+    - Explanation of methodology (e.g., why combining thresholds improves detection)
+    scoring_rubric: null
+    feedback_if_missing: Your exfiltration detection only used one threshold (e.g.,
+      >1MB) but the rubric requires combining statistical (avg + 2*stdev) and absolute
+      (>1MB, >3 transfers) criteria. Re-run with all three conditions.
+  - id: p2_port_scan_detection
+    description: Detect port scanning using 5-minute bins and port diversity analysis
+    type: observed_behavior
+    weight: 12.0
+    check: null
+    objective_ids:
+    - LO2
+    success_criteria:
+    - Uses 5-minute time bins (bin _time span=5m)
+    - Calculates port diversity per source IP per time bin
+    - Identifies top port scanners with supporting SPL
+    - Results include both raw counts and normalized metrics
+    evidence_requirements:
+    - Screenshot of SPL query with bin _time span=5m and port diversity calculation
+    - Screenshot of results table showing top port scanners
+    - Explanation of how port diversity defines scanning behavior
+    scoring_rubric: null
+    feedback_if_missing: "Your port scan detection used a 1-hour bin instead of the\
+      \ required 5-minute window. Also, ensure you\u2019re calculating port diversity\
+      \ (e.g., dc(dest_port)) per source IP per time bin."
+  - id: p2_high_risk_service_exploitation
+    description: Detect high-risk service exploitation via targeted port analysis
+      (ports 21,22,23,135,139,445,3389,5900,8080)
+    type: observed_behavior
+    weight: 11.0
+    check: null
+    objective_ids:
+    - LO2
+    success_criteria:
+    - 'Filters for high-risk ports: 21,22,23,135,139,445,3389,5900,8080'
+    - Identifies top sources targeting high-risk ports
+    - Results include attack classification (e.g., by Tag or service)
+    - Bar chart visualizing top threat sources
+    evidence_requirements:
+    - Screenshot of SPL query filtering for high-risk ports
+    - Screenshot of results table showing top threat sources
+    - Screenshot of bar chart with drilldown-ready data
+    - Explanation of how high-risk ports map to attack types (e.g., SSH brute force,
+      SMB exploitation)
+    scoring_rubric: null
+    feedback_if_missing: "Your high-risk port analysis didn\u2019t include all required\
+      \ ports (21,22,23,135,139,445,3389,5900,8080). Also, ensure your bar chart uses\
+      \ the correct field for X-axis (e.g., ip_src) and Y-axis (e.g., count)."
+- id: part_3_security_monitoring_dashboard
+  title: 'Part 3: Security Monitoring Dashboard'
+  instructions: 'Build a 5-panel Classic Dashboard: (1) Attack percentage KPI (radial
+    gauge), (2) Attack timeline (area chart), (3) Top threat sources (statistics table
+    with drilldown), (4) Attack classification (pie chart), (5) Protocol distribution
+    (column chart). Implement drilldown using $click.value$, $click.value2$, $click.value3$.'
+  expected_outcomes:
+  - id: p3_dashboard_panels
+    description: Implement all 5 required dashboard panels with correct visualizations
+    type: observed_behavior
+    weight: 15.0
+    check: null
+    objective_ids:
+    - LO3
+    success_criteria:
+    - 'All 5 panels present: radial gauge, area chart, statistics table, pie chart,
+      column chart'
+    - Radial gauge shows attack percentage (attack events / total events * 100)
+    - Area chart shows attack timeline over time
+    - Statistics table shows top threat sources with drilldown capability
+    - Pie chart shows attack classification distribution
+    - Column chart shows protocol distribution
+    evidence_requirements:
+    - Screenshot of full dashboard with all 5 panels visible
+    - "Close-up of each panel\u2019s configuration (e.g., chart type, SPL source)"
+    - Verification that SPL queries match required visualizations
+    scoring_rubric: null
+    feedback_if_missing: 'Your dashboard is missing one or more panels (e.g., no radial
+      gauge or column chart). Also, ensure the radial gauge uses SPL like: index=network_traffic
+      | stats count by Tag | eval pct=round((count/total)*100,2) where Tag="attack".'
+  - id: p3_drilldown_functionality
+    description: Implement functional drilldown using SPL variables ($click.value$,
+      etc.)
+    type: observed_behavior
+    weight: 10.0
+    check: null
+    objective_ids:
+    - LO3
+    success_criteria:
+    - 'Drilldown uses correct SPL syntax: $click.value$, $click.value2$, $click.value3$'
+    - Clicking a table row opens a new search filtered by clicked values
+    - Drilldown works for at least one panel (e.g., top threat sources table)
+    evidence_requirements:
+    - Screenshot of drilldown configuration in XML (e.g., <drilldown> block with $click.value$)
+    - Video or animated GIF demonstrating drilldown interaction
+    - Screenshot of resulting filtered search after drilldown
+    scoring_rubric: null
+    feedback_if_missing: "Your drilldown uses static values (e.g., 'ip_src=192.168.1.1')\
+      \ instead of SPL variables ($click.value$). Reconfigure the drilldown to use\
+      \ dynamic variables for the clicked cell\u2019s field value."
+  - id: p3_usage_guide
+    description: Write a concise usage guide explaining dashboard purpose and panel
+      functions
+    type: observed_behavior
+    weight: 5.0
+    check: null
+    objective_ids:
+    - LO3
+    success_criteria:
+    - "Guide explains each panel\u2019s purpose and how to interpret results"
+    - Instructions for using drilldown functionality
+    - Notes on limitations or tuning considerations
+    evidence_requirements:
+    - Text document or embedded text block with usage guide
+    - Clear section headings for each panel
+    - Examples of actionable insights (e.g., 'Review top threat sources for blocking')
+    scoring_rubric: null
+    feedback_if_missing: Your usage guide is missing drilldown instructions or panel
+      interpretations. Also, ensure you explain *why* each panel matters (e.g., 'Radial
+      gauge shows attack ratio at a glance').
+- id: part_4_threat_hunting_investigation
+  title: 'Part 4: Threat Hunting Investigation'
+  instructions: 'Conduct a hypothesis-driven hunt for C2-like behavior using behavioral
+    scoring: off_hours_count > 5 (+3), connections 10-100 (+3), avg_KB < 50 (+2),
+    port_diversity 1-5 (+2). Threshold: c2_score >= 6. Analyze top suspicious source-destination
+    pair and assess detection methodology.'
+  expected_outcomes:
+  - id: p4_c2_scoring_implementation
+    description: Implement C2 behavioral scoring logic exactly as specified
+    type: observed_behavior
+    weight: 10.0
+    check: null
+    objective_ids:
+    - LO4
+    success_criteria:
+    - "Scoring logic matches exactly: off_hours_count > 5 \u2192 +3, connections 10-100\
+      \ \u2192 +3, avg_KB < 50 \u2192 +2, port_diversity 1-5 \u2192 +2"
+    - c2_score >= 6 threshold applied
+    - Top suspicious entities ranked by score
+    evidence_requirements:
+    - Screenshot of SPL query implementing full scoring logic
+    - Screenshot of results table with c2_score column and top suspicious entities
+    - Explanation of how each scoring component maps to C2 behavior
+    scoring_rubric: null
+    feedback_if_missing: "Your scoring logic doesn\u2019t match the rubric: e.g.,\
+      \ you used connections > 10 (not 10-100) or missing the off_hours condition.\
+      \ Re-run with exact thresholds: off_hours_count > 5, connections > 10 AND <\
+      \ 100, avg_KB < 50, port_diversity > 1 AND < 5."
+  - id: p4_c2_investigation_analysis
+    description: Analyze top suspicious source-destination pair and assess detection
+      methodology
+    type: observed_behavior
+    weight: 10.0
+    check: null
+    objective_ids:
+    - LO4
+    success_criteria:
+    - Identifies top suspicious source-destination pair by c2_score
+    - Explains why the pair matches C2 behavior (e.g., off-hours activity, low volume)
+    - Assesses detection limitations (e.g., false positives from legitimate tools)
+    - Suggests improvements (e.g., time-based thresholds, additional IOCs)
+    evidence_requirements:
+    - Screenshot of top suspicious pair with full context (IPs, scores, behavioral
+      metrics)
+    - Written analysis (in comments or separate doc) addressing methodology and limitations
+    - Reflection on how scoring weights affect detection sensitivity
+    scoring_rubric: null
+    feedback_if_missing: "Your analysis only lists the top pair without explaining\
+      \ *why* it\u2019s suspicious (e.g., off_hours_count=7, avg_KB=30). Also, address\
+      \ limitations: e.g., 'This method may flag backup tools as C2 due to off-hours\
+      \ activity.'"
+acceptable_methods:
+- Splunk Enterprise 60-day trial or PSU server (https://splunk.ist.psu.edu/)
+- "Settings \u2192 Add Data \u2192 Upload for CSV ingestion"
+- Index 'network_traffic' with sourcetype 'csv'
+- SPL only (no external scripts, no Python/SPL2 unless explicitly permitted)
+- Classic Dashboards (not Splunk Dashboard Studio)
+- Drilldown using $click.value$, $click.value2$, $click.value3$
+- 'Time bins: 5 minutes for port scan detection'
+- 'Explicit thresholds: exfiltration (avg + 2*stdev, >1MB, >3 transfers), C2 scoring
+  (off_hours>5, connections 10-100, avg_KB<50, port_diversity 1-5)'
+prohibited_behaviors:
+- Paraphrasing ground-truth values (e.g., port numbers, thresholds, scoring weights)
+- Skipping deliverables (tables, screenshots, written analysis)
+- Using non-specified time bins (e.g., 1-hour bins for port scan detection)
+- Modifying C2 scoring logic (e.g., changing weights or thresholds)
+- Using external scripts or Python/SPL2 without explicit permission
+- Submitting dashboards built in Splunk Dashboard Studio instead of Classic
+mentor:
+  allow_questions: true
+  default_help_level: 2
+  reveal_answer: false
+learning_objectives:
+- id: LO1
+  description: The student will be able to install/configure Splunk Enterprise, create
+    a dedicated index, and ingest a CSV dataset with correct sourcetype, verifying
+    data integrity via exploratory queries.
+  measurable_skills:
+  - splunk_installation
+  - index_configuration
+  - data_ingestion
+  - exploratory_spl
+- id: LO2
+  description: The student will be able to construct SPL queries using eventstats,
+    bin, eval, where, and stats to detect data exfiltration, port scanning, and high-risk
+    service exploitation, applying explicit thresholds and time windows.
+  measurable_skills:
+  - statistical_detection
+  - spl_query_construction
+  - threshold_application
+  - time_window_analysis
+- id: LO3
+  description: The student will be able to build a 5-panel Classic Dashboard in Splunk,
+    implement functional drilldown using SPL variables, and document its usage.
+  measurable_skills:
+  - dashboard_design
+  - drilldown_implementation
+  - classic_dashboard_usage
+  - visual_analysis
+- id: LO4
+  description: The student will be able to formulate a behavioral hypothesis, apply
+    a defined scoring model to rank suspicious entities, and interpret results in
+    context of detection limitations.
+  measurable_skills:
+  - hypothesis_formulation
+  - behavioral_scoring
+  - ioc_assessment
+  - detection_limitation_analysis
+signing_key: 8a287abdaae532d63b8e6d0377854c67
+author: null
+created_at: '2026-09-02T20:08:33.187289Z'
+sources: []

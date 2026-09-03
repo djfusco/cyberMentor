@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 
 from app.config import BASE_DIR, get_settings
 from app.models.evaluation import Confidence, EvaluationResult, LLMEvaluationInsights, OutcomeResult
-from app.models.exercise import EnvironmentType, Exercise, ExpectedOutcome, OutcomeType
+from app.models.exercise import EnvironmentType, Exercise, ExpectedOutcome, OutcomeType, VerificationState
 from app.services.capture_manifest import ManifestWriter
 from app.services.evidence import EvidenceEvent, EvidenceService
 from app.services.ollama import OllamaError, OllamaService
@@ -474,6 +474,7 @@ class EvaluatorService:
                 max_score=outcome.weight,
                 confidence=Confidence.verified,
                 evidence=detail.note or "Verified via filesystem check.",
+                verification_state=VerificationState.verified if detail.passed else VerificationState.incorrect,
             )
 
         # observed_behavior AND process outcomes (and any filesystem outcome
@@ -498,9 +499,14 @@ class EvaluatorService:
                 max_score=outcome.weight,
                 confidence=Confidence.unknown,
                 evidence=f"Evidence retrieval failed, so this could not be evaluated: {evidence_error}",
+                verification_state=VerificationState.unverifiable,
             )
 
         judgment = next((j for j in llm_insights.outcome_judgments if j.id == outcome.id), None)
+
+        # Set criteria_implicit deterministically — do not trust what the LLM claimed.
+        if judgment is not None:
+            judgment.criteria_implicit = not outcome.has_explicit_criteria
 
         if judgment is not None and judgment.observed:
             # Screenshots are the primary source of truth for visual exercises
@@ -517,6 +523,8 @@ class EvaluatorService:
                 max_score=outcome.weight,
                 confidence=Confidence.strongly_observed,
                 evidence=judgment.evidence or "Observed in captured screenshots/activity.",
+                verification_state=judgment.verification_state,
+                feedback=judgment.feedback,
             )
 
         if judgment is None:
@@ -535,4 +543,6 @@ class EvaluatorService:
             max_score=outcome.weight,
             confidence=Confidence.unknown,
             evidence=evidence,
+            verification_state=judgment.verification_state if judgment else None,
+            feedback=judgment.feedback if judgment else None,
         )

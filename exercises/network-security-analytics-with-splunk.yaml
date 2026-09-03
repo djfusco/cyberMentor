@@ -1,0 +1,326 @@
+id: network-security-analytics-with-splunk
+title: Network Security Analytics with Splunk
+description: Students configure Splunk Enterprise, load a labeled network traffic
+  dataset, and perform statistical threat detection, dashboard building, and hypothesis-driven
+  threat hunting to identify anomalies like data exfiltration, port scanning, and
+  C2 beaconing.
+instructions: 'Complete five parts: (1) Install Splunk and upload network_traffic_flows.csv;
+  (2) Detect data exfiltration, port scanning, and high-risk port exploitation using
+  SPL; (3) Build a 5-panel classic dashboard with drilldown; (4) Hunt for C2 activity
+  using behavioral scoring; (5) Reflect critically on techniques and limitations.
+  All queries must use SPL only, time range = All time, and dashboards must be classic
+  format.'
+environment:
+  type: terminal
+difficulty: intermediate
+expected_outcomes: []
+steps:
+- id: part_1_splunk_setup_and_data_preparation
+  title: 'Part 1: Splunk Setup & Data Preparation'
+  instructions: "Install Splunk Enterprise (or use PSU\u2019s server at https://splunk.ist.psu.edu/),\
+    \ upload network_traffic_flows.csv using Settings \u2192 Add Data \u2192 Upload,\
+    \ set index = network_traffic and sourcetype = csv, then run statistical queries\
+    \ to verify data integrity and summarize traffic (unique IPs, protocols, apps)."
+  expected_outcomes:
+  - id: data_uploaded_and_indexed
+    description: Data successfully uploaded and indexed with correct sourcetype
+    type: filesystem
+    weight: 5.0
+    check:
+      kind: file_exists
+      path: ~/.splunk/etc/apps/search/local/inputs.conf
+      expected_mode: null
+      pattern: null
+    objective_ids:
+    - LO1
+    success_criteria:
+    - Index 'network_traffic' exists and contains events
+    - Sourcetype is set to 'csv'
+    - 'Events contain fields: src_ip, dst_ip, dst_port, bytes, Tag'
+    evidence_requirements:
+    - Search 'index=network_traffic | head 1' returns events with expected fields
+    - Search 'index=network_traffic | stats count' returns count > 0
+    scoring_rubric: null
+    feedback_if_missing: Re-run the Add Data wizard, select 'network_traffic' as the
+      index, and verify sourcetype is 'csv'. Confirm the file was uploaded without
+      truncation.
+  - id: basic_statistics_generated
+    description: Basic statistical summary of traffic generated
+    type: observed_behavior
+    weight: 10.0
+    check: null
+    objective_ids:
+    - LO1
+    success_criteria:
+    - Unique source IPs, destination IPs, protocols, and applications are computed
+    - 'Queries use SPL commands: stats, values, dc'
+    evidence_requirements:
+    - Screenshot shows results of 'index=network_traffic | stats dc(src_ip) as Unique_Src_IPs,
+      dc(dst_ip) as Unique_Dst_IPs, values(protocol) as Protocols, values(app) as
+      Applications'
+    - Results include non-zero counts for all fields
+    scoring_rubric: null
+    feedback_if_missing: Run a stats query to compute unique values for src_ip, dst_ip,
+      protocol, and app. Ensure 'All time' time range is selected.
+- id: part_2_statistical_threat_detection
+  title: 'Part 2: Statistical Threat Detection'
+  instructions: "Detect three threat types using SPL: (1) data exfiltration (outbound\
+    \ transfers > 2\u03C3 above mean), (2) port scanning (sources probing >100 ports\
+    \ in 5-min bins), (3) high-risk port exploitation (targets on ports 21,22,23,135,139,445,3389,5900,8080).\
+    \ Document methodology and findings."
+  expected_outcomes:
+  - id: exfiltration_detected
+    description: "Data exfiltration detected using 2\u03C3 threshold on outbound bytes"
+    type: observed_behavior
+    weight: 10.0
+    check: null
+    objective_ids:
+    - LO2
+    success_criteria:
+    - Query uses eventstats to compute mean and stdev of bytes
+    - Outliers defined as bytes > mean + 2 * stdev
+    - Top exfiltration sources identified
+    evidence_requirements:
+    - 'Screenshot shows SPL: ''index=network_traffic | eventstats avg(bytes) as avg_bytes,
+      stdev(bytes) as stdev_bytes | where bytes > avg_bytes + 2*stdev_bytes | stats
+      count by src_ip'''
+    - Top sources have bytes significantly above average
+    scoring_rubric: null
+    feedback_if_missing: Re-run the exfiltration query using eventstats (not stats)
+      to compute global mean and stdev, then filter with 'bytes > avg_bytes + 2*stdev_bytes'.
+      Ensure 'All time' is selected.
+  - id: port_scanning_detected
+    description: Port scanning detected using 5-minute bins and port count threshold
+    type: observed_behavior
+    weight: 10.0
+    check: null
+    objective_ids:
+    - LO2
+    success_criteria:
+    - Time bins set to 5 minutes (bin _time span=5m)
+    - Ports per source per bin counted and filtered for >100
+    - Top scanners identified
+    evidence_requirements:
+    - 'Screenshot shows SPL: ''index=network_traffic | bin _time span=5m | stats dc(dst_port)
+      as ports by _time, src_ip | where ports > 100 | stats count by src_ip'''
+    - Top scanners have ports >100 in at least one bin
+    scoring_rubric: null
+    feedback_if_missing: Re-run the port scan query using 'bin _time span=5m' and
+      filter for sources with >100 unique ports per bin. Confirm time range is 'All
+      time'.
+  - id: high_risk_port_exploitation_detected
+    description: High-risk port exploitation detected using known vulnerable ports
+    type: observed_behavior
+    weight: 10.0
+    check: null
+    objective_ids:
+    - LO2
+    success_criteria:
+    - 'Query filters for high-risk ports: 21,22,23,135,139,445,3389,5900,8080'
+    - Top exploited sources/targets identified
+    - Bar chart screenshot included
+    evidence_requirements:
+    - 'Screenshot shows SPL: ''index=network_traffic | where dst_port IN (21,22,23,135,139,445,3389,5900,8080)
+      | stats count by src_ip'''
+    - Bar chart shows top threat sources
+    scoring_rubric: null
+    feedback_if_missing: Re-run the query using 'where dst_port IN (21,22,23,135,139,445,3389,5900,8080)'
+      and generate a bar chart of top sources. Include the chart in your deliverable.
+  - id: methodology_documented
+    description: Methodology and findings documented for all three threat types
+    type: observed_behavior
+    weight: 5.0
+    check: null
+    objective_ids:
+    - LO2
+    success_criteria:
+    - Each detection includes SPL query, threshold justification, and interpretation
+    - Security assessment includes summary of findings
+    evidence_requirements:
+    - Text report includes SPL, thresholds, and interpretation for each threat type
+    - Security assessment explains relative severity of each threat
+    scoring_rubric: null
+    feedback_if_missing: "Document each detection with its SPL query, threshold (e.g.,\
+      \ 2\u03C3), and interpretation (e.g., 'X IPs exfiltrated >Y MB'). Include a\
+      \ short security assessment."
+- id: part_3_security_monitoring_dashboard
+  title: 'Part 3: Security Monitoring Dashboard'
+  instructions: 'Build a classic Splunk dashboard with 5 panels: (1) attack traffic
+    percentage (KPI gauge), (2) attack timeline (area chart), (3) top threat sources
+    (table with drilldown), (4) attack classification (pie chart), (5) protocol distribution
+    (column chart). Include formatting, drilldown, and usage documentation.'
+  expected_outcomes:
+  - id: dashboard_created_with_5_panels
+    description: Classic dashboard created with all 5 required panels
+    type: observed_behavior
+    weight: 10.0
+    check: null
+    objective_ids:
+    - LO3
+    success_criteria:
+    - 'All 5 panel types present: KPI gauge, area chart, table, pie chart, column
+      chart'
+    - Time range = All time
+    - Dashboard screenshot shows all panels visible
+    evidence_requirements:
+    - Screenshot shows dashboard with all 5 panels visible
+    - Panel titles match requirements (e.g., 'Attack Traffic Percentage', 'Top Threat
+      Sources')
+    scoring_rubric: null
+    feedback_if_missing: Rebuild the dashboard using classic format and ensure all
+      5 panel types are included. Take a full screenshot showing all panels.
+  - id: drilldown_configured
+    description: Drilldown configured for top threat sources table
+    type: observed_behavior
+    weight: 5.0
+    check: null
+    objective_ids:
+    - LO3
+    success_criteria:
+    - Drilldown uses $click.value$ to pass IP to new search
+    - Clicking a row triggers a search on that IP
+    evidence_requirements:
+    - Screenshot shows drilldown configuration in XML or UI
+    - Video or screenshot demonstrates clicking a row triggers a new search
+    scoring_rubric: null
+    feedback_if_missing: Configure drilldown on the 'Top Threat Sources' table using
+      $click.value$ to pass the src_ip field to a new search. Demonstrate it works.
+  - id: dashboard_documented
+    description: Dashboard usage documented
+    type: observed_behavior
+    weight: 5.0
+    check: null
+    objective_ids:
+    - LO3
+    success_criteria:
+    - "Documentation explains each panel\u2019s purpose and how to use drilldown"
+    - Formatting rationale included (e.g., why KPI gauge for attack %)
+    evidence_requirements:
+    - Text file or Splunk note includes panel descriptions and usage instructions
+    scoring_rubric: null
+    feedback_if_missing: "Write a short usage guide explaining each panel\u2019s purpose,\
+      \ how to interpret values, and how to use drilldown."
+- id: part_4_threat_hunting_investigation
+  title: 'Part 4: Threat Hunting Investigation'
+  instructions: "Hunt for C2 activity using behavioral heuristics: off-hours connections\
+    \ (off_hours_count > 5), connection count 10\u201399, avg transfer < 50 KB, port\
+    \ diversity 2\u20134. Score suspicious pairs using the explicit scoring logic\
+    \ and analyze top result."
+  expected_outcomes:
+  - id: c2_hunting_query_executed
+    description: C2 hunting query executed with correct scoring logic
+    type: observed_behavior
+    weight: 10.0
+    check: null
+    objective_ids:
+    - LO4
+    success_criteria:
+    - "Off-hours activity: off_hours_count > 5 \u2192 +3"
+    - "Connection count 10\u201399 \u2192 +3"
+    - "Avg transfer < 50 KB \u2192 +2"
+    - "Port diversity 2\u20134 \u2192 +2"
+    - c2_score >= 6 threshold applied
+    evidence_requirements:
+    - Screenshot shows SPL implementing all scoring components
+    - Top results have c2_score >= 6
+    scoring_rubric: null
+    feedback_if_missing: "Re-run the C2 hunting query with exact scoring: +3 for off_hours_count\
+      \ > 5, +3 for connections 10\u201399, +2 for avg_KB < 50, +2 for port_diversity\
+      \ 2\u20134. Filter for c2_score >= 6."
+  - id: top_c2_result_analyzed
+    description: Top C2 result analyzed with IOC list and scoring rationale
+    type: observed_behavior
+    weight: 10.0
+    check: null
+    objective_ids:
+    - LO4
+    success_criteria:
+    - Top result identified with full behavioral breakdown
+    - IOC list includes src_ip, dst_ip, ports, timing
+    - Scoring rationale explicitly ties to components
+    evidence_requirements:
+    - Text report includes top result, IOC list, and scoring breakdown per component
+    scoring_rubric: null
+    feedback_if_missing: Analyze the top-scoring pair and list IOCs (src_ip, dst_ip,
+      ports, off-hours activity). Explain how each scoring component contributed to
+      the final score.
+- id: part_5_critical_reflection
+  title: 'Part 5: Critical Reflection'
+  instructions: 'Reflect on SPL techniques, detection accuracy, scalability, and career
+    relevance. Address: limitations of statistical vs. signature-based detection,
+    dashboard utility, and generalizability of scoring systems.'
+  expected_outcomes:
+  - id: reflection_submitted
+    description: Critical reflection submitted covering all required topics
+    type: observed_behavior
+    weight: 5.0
+    check: null
+    objective_ids:
+    - LO5
+    success_criteria:
+    - Reflection addresses SPL technique limitations
+    - Detection accuracy tradeoffs discussed
+    - Scalability concerns addressed
+    - Career relevance articulated
+    evidence_requirements:
+    - Text report includes all 4 required topics
+    - Reflection shows critical thinking (not just summary)
+    scoring_rubric: null
+    feedback_if_missing: Write a reflection covering SPL limitations (e.g., false
+      positives), dashboard benefits (e.g., reduced cognitive load), and how scoring
+      systems may or may not generalize across environments.
+acceptable_methods:
+- "Use Settings \u2192 Add Data \u2192 Upload to load CSV"
+- 'Use SPL: stats, eventstats, where, eval, bin, timechart, values, dc, sum, count,
+  head, sort, case, strftime'
+- Use classic dashboards (not modern)
+- Set time range = All time
+- Use eventstats (not streamstats) for global statistics
+prohibited_behaviors:
+- Use search instead of where for numeric filtering
+- Hardcode IPs or ports without justification
+- Use non-SPL tools (e.g., Python) for analysis
+- Skip drilldown configuration in dashboard
+- Use time bins other than 5 minutes for port scan detection
+mentor:
+  allow_questions: true
+  default_help_level: 2
+  reveal_answer: false
+learning_objectives:
+- id: LO1
+  description: Configure Splunk Enterprise and verify ingestion of labeled network
+    traffic data
+  measurable_skills:
+  - Upload CSV data via Add Data wizard
+  - Verify index and sourcetype configuration
+  - Run basic statistical queries to confirm data integrity
+- id: LO2
+  description: Detect three threat types using SPL statistical methods with correct
+    thresholds
+  measurable_skills:
+  - Use eventstats to compute global statistics
+  - "Apply 2\u03C3 outlier detection for exfiltration"
+  - Bin time windows to detect port scanning behavior
+- id: LO3
+  description: Build a classic Splunk dashboard with 5 panels, drilldown, and formatting
+  measurable_skills:
+  - Create KPI gauge, area chart, table, pie chart, and column chart
+  - Configure drilldown using $click.value$ expressions
+  - Apply visual formatting and documentation
+- id: LO4
+  description: Conduct behavioral threat hunting for C2 using explicit scoring heuristics
+  measurable_skills:
+  - Apply off-hours, transfer size, and port diversity filters
+  - Compute behavioral scores per IP pair
+  - Identify and justify top-scoring IOCs
+- id: LO5
+  description: Critically reflect on SPL techniques, detection accuracy, scalability,
+    and career relevance
+  measurable_skills:
+  - Compare statistical vs. signature-based detection
+  - Evaluate false positive tradeoffs
+  - Articulate real-world applicability
+signing_key: 45927dbbdf534e20fd4844222f41b922
+author: null
+created_at: '2026-09-03T01:04:12.717322Z'
+sources: []

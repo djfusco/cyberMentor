@@ -3,10 +3,11 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from pydantic import Field as PydanticField
 from sqlmodel import Field, SQLModel
 
+from app.models.exercise import VerificationState
 from app.models.session import utcnow
 
 
@@ -28,6 +29,9 @@ class OutcomeResult(BaseModel):
     # None for single-task exercises (see Exercise.get_steps()).
     step_id: Optional[str] = None
     step_title: Optional[str] = None
+    # new additive fields — safe defaults for backward compat
+    verification_state: Optional[VerificationState] = None
+    feedback: Optional[str] = None
 
 
 class EvaluationResult(BaseModel):
@@ -52,21 +56,28 @@ class EvaluationResult(BaseModel):
 
 class OutcomeJudgment(BaseModel):
     """The LLM's per-outcome judgment for a non-filesystem (observed_behavior
-    or process) outcome -- e.g. "did the learner click Submit and see the
-    confirmation message". Generalizes what used to be a single hardcoded
-    terminal-verification-keyword check into a judgment about any described
-    behavior, in any environment.
-
-    The LLM should only ever choose `inferred` or `unknown` for confidence;
-    `strongly_observed` is reserved for when deterministic evidence (e.g. a
-    literal verification command) supplements the judgment -- see
-    EvaluatorService._score_from_judgment.
+    or process) outcome. For enriched labs, also carries structured criterion
+    assessment. criteria_implicit is set by result-parsing code from
+    outcome.has_explicit_criteria — never trusted from the LLM.
     """
+
+    @field_validator("verification_state", mode="before")
+    @classmethod
+    def normalise_verification_state(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
 
     id: str
     observed: bool
     confidence: Confidence = Confidence.inferred
     evidence: str = ""
+    # additive fields — safe defaults for backward compat
+    verification_state: Optional[VerificationState] = None  # required in enriched labs; nullable for legacy
+    criteria_met: List[str] = PydanticField(default_factory=list)
+    criteria_not_met: List[str] = PydanticField(default_factory=list)
+    feedback: Optional[str] = None
+    criteria_implicit: bool = False  # set by result parser from outcome.has_explicit_criteria
 
 
 class LLMEvaluationInsights(BaseModel):

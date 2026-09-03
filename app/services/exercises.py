@@ -90,6 +90,41 @@ class ExerciseService:
         destination.write_text(raw_yaml)
         return exercise
 
+    def delete_exercise(self, exercise_id: str) -> None:
+        """Delete the YAML file for a published exercise.
+
+        Caller is responsible for checking that no student sessions reference
+        this exercise before calling — this method does not check.
+        """
+        path = self.get_exercise_file_path(exercise_id)
+        if path is None:
+            raise ExerciseLoadError(f"Exercise '{exercise_id}' not found")
+        path.unlink()
+
+    def duplicate_exercise(self, exercise_id: str) -> Exercise:
+        """Copy a published exercise with a new unique ID and '(Copy)' title suffix.
+
+        The new ID is generated as '<original-id>-copy-<4-hex-chars>' to avoid
+        collisions. Returns the newly saved Exercise.
+        """
+        import secrets as _secrets
+        path = self.get_exercise_file_path(exercise_id)
+        if path is None:
+            raise ExerciseLoadError(f"Exercise '{exercise_id}' not found")
+        original_yaml = path.read_text()
+        try:
+            raw = yaml.safe_load(original_yaml)
+        except yaml.YAMLError as exc:
+            raise ExerciseLoadError(f"invalid YAML: {exc}") from exc
+        suffix = _secrets.token_hex(2)  # 4 hex chars
+        new_id = f"{exercise_id}-copy-{suffix}"
+        raw["id"] = new_id
+        raw["title"] = raw.get("title", exercise_id) + " (Copy)"
+        if "signing_key" in raw:
+            raw["signing_key"] = _secrets.token_hex(16)
+        new_yaml = yaml.safe_dump(raw, sort_keys=False)
+        return self.save_exercise_yaml(new_yaml)
+
     def _load_file(self, path: Path) -> Exercise:
         try:
             raw = yaml.safe_load(path.read_text())

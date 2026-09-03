@@ -113,4 +113,6 @@ def get_session_query_service():
 def get_exercise_author_service():
     from app.services.exercise_author import ExerciseAuthorService
 
-    return ExerciseAuthorService(get_ollama_service(), get_exercise_service(), get_reference_service())
+    settings = get_settings()
+    authoring_ollama = OllamaService(timeout=settings.authoring_timeout_seconds)
+    return ExerciseAuthorService(authoring_ollama, get_exercise_service(), get_reference_service())

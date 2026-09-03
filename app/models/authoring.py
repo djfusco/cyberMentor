@@ -17,6 +17,7 @@ class AuthoringStatus(str, Enum):
     drafting = "drafting"
     finalized = "finalized"
     saved = "saved"
+    editing = "editing"
 
 
 class ExerciseAuthoringSession(SQLModel, table=True):
@@ -28,6 +29,9 @@ class ExerciseAuthoringSession(SQLModel, table=True):
     # YAML, shown as a preview before being written to exercises/.
     draft_yaml: Optional[str] = None
     saved_exercise_id: Optional[str] = None
+    exercise_title: Optional[str] = None
+    updated_at: Optional[datetime] = None
+    is_edit_of: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
 
 

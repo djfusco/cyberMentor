@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     # run longer without also raising the mentor/evaluator timeouts. Override
     # with SESSION_QUERY_TIMEOUT_SECONDS.
     session_query_timeout_seconds: float = 180.0
+    # Per-call timeout for exercise authoring LLM calls (chat, seed, finalize).
+    # Generating a complete exercise YAML from a document is much heavier than
+    # a mentor chat turn — qwen3-coder-next:latest can take 2-3 minutes for a
+    # full exercise. Separate so mentor/evaluator timeouts stay unchanged.
+    # Override with AUTHORING_TIMEOUT_SECONDS.
+    authoring_timeout_seconds: float = 300.0
 
     # Authoring-only frontier research assistant (see app/services/research.py).
     # This is a deliberate, narrow exception to the local-only design -- it
