@@ -432,10 +432,19 @@ fn capture_loop(
     app_rx: Option<&std::sync::mpsc::Receiver<app_observer::AppChangeEvent>>,
 ) -> i32 {
     while running.load(Ordering::SeqCst) {
-        // Cross-process stop check.
+        // Cross-process stop check. Deliberately no `break` here: storing
+        // `false` lets this iteration run one more full capture tick below
+        // (of whatever app/window/text is currently focused) before the
+        // `while running.load(...)` condition -- re-checked at the top of
+        // the next pass, including via any `continue` further down -- ends
+        // the loop. Without this, a student action that only became visible
+        // between the last tick and the stop signal (e.g. a final `ls -l`
+        // to verify the result) could be missed entirely, since the loop
+        // would otherwise exit before ever sampling it. This mirrors how
+        // Ctrl+C already behaves: the ctrlc handler only sets `running` to
+        // false and never breaks the loop itself.
         if stop::stop_requested(session_id) {
             running.store(false, Ordering::SeqCst);
-            break;
         }
 
         // Pump the main run loop briefly so event tap + notifications fire.
