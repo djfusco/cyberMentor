@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 from app.models.exercise import Exercise, LearningObjective
 from app.services.evidence import EvidenceEvent
-from app.services.verifier import VerificationDetail, needs_llm_attribution
+from app.services.verifier import EvidenceFact, VerificationDetail, needs_llm_attribution
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +228,24 @@ def format_verification(verification: Optional[Dict[str, VerificationDetail]]) -
     for key, detail in verification.items():
         status = "PASS" if detail.passed else "FAIL"
         lines.append(f"- {key}: {status} -- {detail.note}")
+    return "\n".join(lines)
+
+
+def format_evidence_facts(evidence_facts: Optional[List[EvidenceFact]]) -> str:
+    """Structural facts already established deterministically from captured
+    text (see app.services.verifier) -- shown to the LLM as reliable
+    corroborating context so it does not need to re-derive them from noisy
+    OCR text itself. These are informational only here; scoring applies them
+    independently (see EvaluatorService._score_from_judgment), so an absent
+    or "not present" fact never blocks a judgment based on other evidence
+    (e.g. a screenshot) the LLM finds instead.
+    """
+    if not evidence_facts:
+        return "(none established for this exercise)"
+    lines = []
+    for fact in evidence_facts:
+        status = "PRESENT" if fact.present else "not found"
+        lines.append(f"- [{fact.outcome_id}] {status}: {fact.detail}")
     return "\n".join(lines)
 
 
@@ -690,6 +708,19 @@ and CONTEXT, not by exact string matching:
   evidence, your evidence text for each must name the specific, real
   difference that justifies it (e.g. different actions, different outcomes
   covered), never mere inconsistency in how much OCR noise you tolerated.
+- OCR quality is a capture limitation, never the learner's fault. When text
+  is garbled, describe what the STRUCTURE shows (or say you cannot confirm
+  it); do not phrase feedback as if the learner mistyped, misread, or did
+  anything wrong -- the ambiguity is in the capture, not their actions.
+
+FEEDBACK FOR A NOT-YET-DEMONSTRATED, ALREADY-EXISTING outcome: when a
+filesystem outcome's state already existed before the session began and
+nothing this session demonstrated producing it (see the baseline-attribution
+guidance above), never suggest running mkdir/touch/recreating the object as
+if that would "prove" creation -- the object already exists, so redoing it
+would misrepresent what happened. If demonstrating creation genuinely
+matters, suggest starting from a clean/reset lab workspace instead (a
+setup/administration action, not something to fabricate mid-session).
 
 You ARE responsible for:
 1. Judging the learner's process: whether their approach was reasonable,
@@ -780,6 +811,7 @@ def build_evaluation_user_prompt(
     frame_captions: Optional[str] = None,
     max_events: int = 80,
     baseline_verification: Optional[dict] = None,
+    evidence_facts: Optional[List[EvidenceFact]] = None,
 ) -> Tuple[str, bool]:
     outcomes = format_outcomes_for_evaluation(exercise)
     acceptable = "\n".join(f"- {m}" for m in exercise.acceptable_methods) or "(none specified)"
@@ -834,6 +866,12 @@ Prohibited behaviors:
 
 Deterministic verification (ground truth, do not contradict):
 {format_verification(verification)}
+
+Structured evidence facts (already established mechanically from captured
+text -- treat as reliable, do not second-guess a PRESENT fact, but you may
+still find and cite additional evidence yourself for anything marked "not
+found" here):
+{format_evidence_facts(evidence_facts)}
 
 Observed activity timeline for the full session (most recent last):
 {timeline}

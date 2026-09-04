@@ -24,7 +24,9 @@ from typing import Any, Dict, List, Optional, Protocol
 
 from pydantic import BaseModel
 
+from app.models.evaluation import EvidenceBasis
 from app.models.exercise import CheckKind, CheckSpec, Exercise, OutcomeType
+from app.services.evidence import EvidenceEvent
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +112,175 @@ class LinuxFilePermissionsVerifier:
                 note=permissions_note,
             ),
         }
+
+
+# -- Structured evidence facts (terminal-evidence corroboration) -------------
+#
+# A deterministic Verifier reads filesystem state; it says nothing about
+# captured activity. The complementary problem this section solves: some
+# terminal-evidence facts (a permission-changing command ran, a long-format
+# permission listing was produced) are reliably recognizable from their
+# STRUCTURE, without needing an LLM to re-derive them from noisy OCR text
+# every time. Extracting them once, deterministically, with provenance (what
+# text produced the fact) means the LLM is no longer the *only* authority for
+# facts this reliable -- see EvaluatorService._score_from_judgment, which
+# treats a present, action-basis fact as sufficient corroborating evidence on
+# its own, corroborating rather than replacing the LLM's judgment for
+# everything else (screenshots, less common commands, GUI actions, ...).
+#
+# Deliberately NOT a shell parser: each fact is one narrow, explainable
+# regex-based structural check, tolerant of realistic OCR noise the way a
+# human skimming a blurry screenshot would be, never a rewrite of the
+# underlying text (nothing here ever mutates captured evidence).
+
+
+class EvidenceFact(BaseModel):
+    """One structurally-derived fact about captured evidence, with the
+    outcome it corroborates and the text it came from (provenance)."""
+
+    key: str
+    outcome_id: str
+    present: bool
+    detail: str
+    basis: EvidenceBasis
+
+
+class EvidenceFactExtractor(Protocol):
+    def extract(
+        self,
+        exercise: Exercise,
+        events: List[EvidenceEvent],
+        verification: Dict[str, VerificationDetail],
+    ) -> List[EvidenceFact]:
+        ...
+
+
+class LinuxPermissionEvidenceFacts:
+    """Structural evidence extraction paired with LinuxFilePermissionsVerifier
+    -- recognizes the SHAPE of a `chmod`-style mode-changing command and the
+    SHAPE of a long-format permission listing (`ls -l`/`stat`/`getfacl`-style
+    output) in captured terminal text, independent of exact OCR fidelity.
+
+    Narrow by design: one command family (chmod) and one output shape
+    (long-format listing), each a single small regex -- not a general shell
+    parser. Only registered for linux-file-permissions-001-shaped exercises
+    (see _EVIDENCE_FACT_EXTRACTORS below); every other exercise gets zero
+    facts and is entirely unaffected (evaluation falls back to plain LLM
+    judgment, exactly as before this module existed).
+    """
+
+    # A chmod invocation with an octal or symbolic mode argument. Matches the
+    # command family, not any particular file/path -- works for any chmod
+    # call, on any exercise that has one.
+    _CHMOD_RE = re.compile(r"\bchmod\s+([0-7]{3,4}|[ugoa]*[+\-=][rwxXst]+)\b", re.IGNORECASE)
+
+    # The first column of `ls -l`/similar output: a file-type character
+    # followed by nine permission-bit characters. Tolerant of OCR noise in
+    # the permission bits themselves (any letter or dash) since the
+    # surrounding structural checks (total/date/size, in _has_listing_shape)
+    # are what actually establish this is a listing, not the exact
+    # characters of this one token. Restricted to the file-type characters
+    # ('-', 'd', 'l' -- regular file, directory, symlink) that actually occur
+    # in this lab's own realistic output, rather than the full ls(1) set --
+    # the wider set (p/s/c/b) collided with ordinary words (e.g. "secure"
+    # starts with 's', an ls(1) socket indicator).
+    _MODE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[-dl][A-Za-z\-]{9}(?![A-Za-z0-9])")
+    _TOTAL_RE = re.compile(r"\btotal\b", re.IGNORECASE)
+    _MONTH_RE = re.compile(
+        r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", re.IGNORECASE
+    )
+    _TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
+    _SIZE_RE = re.compile(r"(?<![\d.])\d+(?![\d.])")
+
+    def extract(
+        self,
+        exercise: Exercise,
+        events: List[EvidenceEvent],
+        verification: Dict[str, VerificationDetail],
+    ) -> List[EvidenceFact]:
+        facts = [self._find_chmod_action(events)]
+        # Only worth looking for a permission listing if this exercise
+        # actually has a mode-correctness outcome to corroborate.
+        if "permissions_correct" in verification:
+            facts.append(self._find_permission_listing(events))
+        return facts
+
+    def _find_chmod_action(self, events: List[EvidenceEvent]) -> EvidenceFact:
+        for event in events:
+            match = self._CHMOD_RE.search(event.text)
+            if match:
+                return EvidenceFact(
+                    key="permission_change_action_observed",
+                    outcome_id="permissions_correct",
+                    present=True,
+                    detail=f'Captured text shows a chmod-style command: "{match.group(0).strip()}".',
+                    basis=EvidenceBasis.action,
+                )
+        return EvidenceFact(
+            key="permission_change_action_observed",
+            outcome_id="permissions_correct",
+            present=False,
+            detail="No chmod-style (or equivalent mode-changing) command found in captured text.",
+            basis=EvidenceBasis.unclear,
+        )
+
+    def _find_permission_listing(self, events: List[EvidenceEvent]) -> EvidenceFact:
+        for event in events:
+            if self._has_listing_shape(event.text):
+                return EvidenceFact(
+                    key="permission_listing_observed",
+                    outcome_id="permissions_verified",
+                    present=True,
+                    detail=(
+                        "Captured text has a 'total' header, a permission-mode-shaped token, and "
+                        "size/date information together -- structurally a long-format permission "
+                        "listing (ls -l, stat, getfacl, or equivalent), regardless of exact OCR "
+                        "fidelity on the command or token text."
+                    ),
+                    basis=EvidenceBasis.action,
+                )
+        return EvidenceFact(
+            key="permission_listing_observed",
+            outcome_id="permissions_verified",
+            present=False,
+            detail="No long-format permission-listing structure found in captured text.",
+            basis=EvidenceBasis.unclear,
+        )
+
+    def _has_listing_shape(self, text: str) -> bool:
+        """A long-format listing needs a 'total' header, a permission-shaped
+        token, AND (a date-like token or a size-like number) -- requiring
+        several independent structural cues together is what keeps this from
+        false-matching plain filename lists (e.g. genuine `ls -1` output,
+        which has none of these) or unrelated text that merely contains one
+        of these cues in isolation.
+        """
+        if not self._TOTAL_RE.search(text):
+            return False
+        if not self._MODE_TOKEN_RE.search(text):
+            return False
+        has_date = bool(self._MONTH_RE.search(text) or self._TIME_RE.search(text))
+        has_size = bool(self._SIZE_RE.search(text))
+        return has_date or has_size
+
+
+_EVIDENCE_FACT_EXTRACTORS: Dict[str, EvidenceFactExtractor] = {
+    "linux-file-permissions-001": LinuxPermissionEvidenceFacts(),
+}
+
+
+def extract_evidence_facts(
+    exercise: Exercise,
+    events: List[EvidenceEvent],
+    verification: Dict[str, VerificationDetail],
+) -> List[EvidenceFact]:
+    """Structural evidence facts for this exercise, or [] when none are
+    registered -- evaluation is unaffected either way (see
+    EvaluatorService._score_from_judgment)."""
+    extractor = _EVIDENCE_FACT_EXTRACTORS.get(exercise.id)
+    if extractor is None:
+        return []
+    return extractor.extract(exercise, events, verification)
 
 
 class GenericDeclarativeVerifier:

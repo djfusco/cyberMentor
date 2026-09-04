@@ -6,6 +6,7 @@ verification, the LLM's opinion is never used to decide pass/fail.
 """
 import base64
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +25,13 @@ from app.services.prompts import (
 )
 from app.services.keyframes import SelectedFrame, format_frame_captions, select_keyframes
 from app.services.token_budget import fit_to_budget
-from app.services.verifier import VerificationDetail, needs_llm_attribution, run_verification
+from app.services.verifier import (
+    EvidenceFact,
+    VerificationDetail,
+    extract_evidence_facts,
+    needs_llm_attribution,
+    run_verification,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +225,79 @@ def _select_model(exercise: Exercise, events: List[EvidenceEvent], settings) -> 
     )
 
 
+# -- Report-consistency reconciliation ----------------------------------------
+#
+# The LLM's free-text summary/strengths/observed_approach are generated in
+# the SAME response as its structured outcome_judgments, but the SCORE comes
+# from outcomes that may have since been overridden by deterministic rules
+# the LLM never sees applied (baseline attribution, the evidence_basis gate,
+# a failed final-state check). Nothing previously reconciled the narrative
+# against that final, authoritative outcome list, so a locally-correct-
+# sounding sentence ("the learner set permissions and verified them") could
+# survive alongside a 0-scored outcome for the exact same thing. This
+# section makes the scored OutcomeResult list the single source of truth for
+# what the narrative is allowed to claim -- not a second, independent
+# interpretation.
+#
+# Deliberately NOT sentence-level NLP: a small, explainable keyword-overlap
+# check scoped to each outcome's OWN authored wording (description /
+# student_demonstration), used only to detect and replace/drop narrative
+# that credits a specific NOT-PASSED outcome -- never to rewrite prose.
+
+_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "this", "that", "of", "to", "in", "on",
+    "for", "and", "or", "with", "student", "learner", "their", "its", "it", "as", "by",
+    "during", "session", "already", "e", "g",
+}
+# Words that, alongside topic overlap with a NOT-PASSED outcome and no
+# nearby negation, mark a summary sentence as affirmatively (wrongly)
+# claiming that outcome was completed.
+_COMPLETION_CUES = {
+    "created", "creates", "creating", "set", "sets", "configured", "configures",
+    "verified", "verifies", "verifying", "completed", "completes", "demonstrated",
+    "demonstrates", "successfully", "did", "performed", "performs", "ran", "runs",
+    "established", "establishes", "confirmed", "confirms", "applied", "applies",
+}
+_NEGATION_CUES = {
+    "not", "never", "no", "without", "unable", "fail", "fails", "failed", "missing",
+    "absent", "cannot", "couldn't", "didn't", "wasn't", "weren't", "isn't", "aren't",
+    "n't",
+}
+
+
+def _significant_words(text: Optional[str]) -> set:
+    if not text:
+        return set()
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in _STOPWORDS and len(w) > 2}
+
+
+def _outcome_reference_words(outcome: ExpectedOutcome) -> set:
+    # `description` only, deliberately: it's short and topic-focused (e.g.
+    # "~/secure-data exists"), which is what makes a ratio-based overlap
+    # check meaningful. `student_demonstration` is a full paragraph written
+    # for prompt guidance (see format_outcomes_for_evaluation) -- unioning
+    # it in here would dilute the ratio so much that almost nothing could
+    # ever cross the threshold.
+    return _significant_words(outcome.description)
+
+
+def _mentions_outcome(text_words: set, outcome_words: set, threshold: float = 0.5) -> bool:
+    """True when `text_words` closely echoes an outcome's OWN authored
+    wording -- at least two overlapping significant words, and at least
+    `threshold` of the outcome's reference words present. Requiring both a
+    minimum count and a minimum ratio keeps a single common word (or a
+    short description) from triggering a match on its own.
+    """
+    if not outcome_words:
+        return False
+    overlap = text_words & outcome_words
+    return len(overlap) >= 2 and len(overlap) / len(outcome_words) >= threshold
+
+
+def _split_sentences(text: str) -> List[str]:
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
+
+
 class EvaluatorService:
     def __init__(self, ollama: OllamaService):
         self.ollama = ollama
@@ -238,9 +318,18 @@ class EvaluatorService:
         if exercise.environment.type == EnvironmentType.terminal:
             events = EvidenceService.filter_terminal_events(events)
 
+        # Structural, deterministic facts about captured evidence (e.g. "a
+        # chmod-style command ran", "a long-format permission listing was
+        # produced") -- [] for exercises with no registered extractor, so
+        # this has zero effect anywhere else. See app.services.verifier and
+        # _score_from_judgment, which treats a present, action-basis fact as
+        # sufficient on its own rather than relying solely on the LLM to
+        # re-derive the same fact from noisy OCR text.
+        evidence_facts = extract_evidence_facts(exercise, events, verification)
+
         llm_insights = await self._get_llm_insights(
             exercise, events, verification, evidence_error, session_id, manifest=manifest,
-            baseline_verification=baseline_verification,
+            baseline_verification=baseline_verification, evidence_facts=evidence_facts,
         )
 
         outcomes: List[OutcomeResult] = []
@@ -249,7 +338,7 @@ class EvaluatorService:
             for outcome in step.expected_outcomes:
                 result = self._score_outcome(
                     outcome, verification, events, llm_insights, evidence_error,
-                    baseline_verification=baseline_verification,
+                    baseline_verification=baseline_verification, evidence_facts=evidence_facts,
                 )
                 if is_real_step:
                     result.step_id = step.id
@@ -257,13 +346,17 @@ class EvaluatorService:
                 outcomes.append(result)
         total_score = sum(o.score for o in outcomes)
 
+        summary, strengths, observed_approach = self._reconcile_narrative(
+            exercise, outcomes, llm_insights.summary, llm_insights.strengths, llm_insights.observed_approach,
+        )
+
         return EvaluationResult(
             score=round(total_score, 1),
             outcomes=outcomes,
-            summary=llm_insights.summary,
-            strengths=llm_insights.strengths,
+            summary=summary,
+            strengths=strengths,
             improvements=llm_insights.improvements,
-            observed_approach=llm_insights.observed_approach,
+            observed_approach=observed_approach,
             alternative_approaches=llm_insights.alternative_approaches,
             risky_or_unnecessary_steps=llm_insights.risky_or_unnecessary_steps,
             evidence_error=evidence_error,
@@ -278,6 +371,7 @@ class EvaluatorService:
         session_id: Optional[str] = None,
         manifest: Optional[ManifestWriter] = None,
         baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
+        evidence_facts: Optional[List[EvidenceFact]] = None,
     ) -> LLMEvaluationInsights:
         settings = get_settings()
         routing = _select_model(exercise, events, settings)
@@ -308,7 +402,7 @@ class EvaluatorService:
             prompt, per_event_truncated = build_evaluation_user_prompt(
                 exercise, events, verification, evidence_error,
                 has_images=use_vision, frame_captions=frame_captions, max_events=count,
-                baseline_verification=baseline_verification,
+                baseline_verification=baseline_verification, evidence_facts=evidence_facts,
             )
             return EVALUATION_SYSTEM_PROMPT, prompt, per_event_truncated
 
@@ -466,6 +560,29 @@ class EvaluatorService:
         insights.outcome_judgments = list(by_id.values())
         return insights
 
+    @staticmethod
+    def _matching_action_fact(
+        outcome_id: str, evidence_facts: Optional[List[EvidenceFact]]
+    ) -> Optional[EvidenceFact]:
+        for fact in evidence_facts or []:
+            if fact.outcome_id == outcome_id and fact.present and fact.basis == EvidenceBasis.action:
+                return fact
+        return None
+
+    # Feedback text shown when a filesystem outcome's compliant state already
+    # existed at baseline and no current-session action demonstrated it --
+    # deliberately overrides whatever the LLM's own per-outcome feedback said,
+    # since that's exactly the situation where an LLM is prone to suggesting
+    # `mkdir`/`touch` to "prove" creation of something that already exists.
+    # No files are deleted or reset -- see app.routes.sessions -- this only
+    # ever recommends a clean workspace, never performs one.
+    _ALREADY_EXISTED_FEEDBACK = (
+        "This already existed before the session started, so nothing this "
+        "session could prove creating it. If demonstrating creation matters "
+        "here, start from a clean/reset lab workspace rather than deleting "
+        "or recreating existing files by hand."
+    )
+
     def _score_outcome(
         self,
         outcome: ExpectedOutcome,
@@ -474,10 +591,12 @@ class EvaluatorService:
         llm_insights: LLMEvaluationInsights,
         evidence_error: Optional[str] = None,
         baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
+        evidence_facts: Optional[List[EvidenceFact]] = None,
     ) -> OutcomeResult:
         if outcome.type == OutcomeType.filesystem and outcome.id in verification:
             return self._score_filesystem_outcome(
-                outcome, verification, baseline_verification, events, llm_insights, evidence_error
+                outcome, verification, baseline_verification, events, llm_insights, evidence_error,
+                evidence_facts,
             )
 
         # observed_behavior AND process outcomes (and any filesystem outcome
@@ -485,7 +604,7 @@ class EvaluatorService:
         # per-outcome LLM judgment -- there is no app-specific ground truth to
         # fall back on, so this is the only mechanism available for anything
         # that isn't a declared filesystem check.
-        return self._score_from_judgment(outcome, events, llm_insights, evidence_error)
+        return self._score_from_judgment(outcome, events, llm_insights, evidence_error, evidence_facts)
 
     def _score_filesystem_outcome(
         self,
@@ -495,6 +614,7 @@ class EvaluatorService:
         events: List[EvidenceEvent],
         llm_insights: LLMEvaluationInsights,
         evidence_error: Optional[str] = None,
+        evidence_facts: Optional[List[EvidenceFact]] = None,
     ) -> OutcomeResult:
         """Deterministic verification proves a final state exists; it says
         nothing about whether THIS session produced it. Distinguish the two
@@ -548,8 +668,17 @@ class EvaluatorService:
 
         # The compliant state already existed before this session began --
         # only current-session evidence of the action can still earn credit.
-        result = self._score_from_judgment(outcome, events, llm_insights, evidence_error)
+        result = self._score_from_judgment(outcome, events, llm_insights, evidence_error, evidence_facts)
         result.final_state_verified = True
+
+        fact = self._matching_action_fact(outcome.id, evidence_facts)
+        if fact is not None and result.passed:
+            # _score_from_judgment already credited this from a structural
+            # fact, not an LLM judgment -- that fact IS the action evidence,
+            # so the gate below (which exists to distrust a bare LLM
+            # observed=true) does not apply here.
+            result.demonstrated_this_session = True
+            return result
 
         # Mechanical backstop: never trust a bare observed=true here. Look up
         # the judgment's own evidence_basis and require it to be "action" --
@@ -571,12 +700,14 @@ class EvaluatorService:
                 "performed during this session, so this is not demonstrated "
                 "this attempt."
             )
+            result.feedback = self._ALREADY_EXISTED_FEEDBACK
         elif not result.passed and not evidence_error:
             result.evidence = (
                 "This state already existed when the session started, and no "
                 "current-session activity demonstrated it again -- not "
                 "demonstrated this attempt."
             )
+            result.feedback = self._ALREADY_EXISTED_FEEDBACK
 
         result.demonstrated_this_session = result.passed
         return result
@@ -587,6 +718,7 @@ class EvaluatorService:
         events: List[EvidenceEvent],
         llm_insights: LLMEvaluationInsights,
         evidence_error: Optional[str] = None,
+        evidence_facts: Optional[List[EvidenceFact]] = None,
     ) -> OutcomeResult:
         if evidence_error:
             return OutcomeResult(
@@ -597,6 +729,25 @@ class EvaluatorService:
                 confidence=Confidence.unknown,
                 evidence=f"Evidence retrieval failed, so this could not be evaluated: {evidence_error}",
                 verification_state=VerificationState.unverifiable,
+            )
+
+        fact = self._matching_action_fact(outcome.id, evidence_facts)
+        if fact is not None:
+            # A structurally-derived, deterministic fact (see
+            # app.services.verifier) establishes current-session action
+            # evidence on its own -- not solely the LLM's structured output,
+            # which is what this corroborates against: a local model can
+            # correctly reason about an action in its free-text summary yet
+            # still return an inconsistent/missing structured judgment for
+            # the same outcome. Trust the fact even when that happens.
+            return OutcomeResult(
+                id=outcome.id,
+                passed=True,
+                score=outcome.weight,
+                max_score=outcome.weight,
+                confidence=Confidence.verified,
+                evidence=fact.detail,
+                verification_state=VerificationState.verified,
             )
 
         judgment = next((j for j in llm_insights.outcome_judgments if j.id == outcome.id), None)
@@ -643,3 +794,84 @@ class EvaluatorService:
             verification_state=judgment.verification_state if judgment else None,
             feedback=judgment.feedback if judgment else None,
         )
+
+    def _reconcile_narrative(
+        self,
+        exercise: Exercise,
+        outcomes: List[OutcomeResult],
+        summary: str,
+        strengths: List[str],
+        observed_approach: List[str],
+    ) -> tuple:
+        """Make the final, scored `outcomes` list authoritative over the
+        LLM's free-text narrative -- see the module docstring above
+        _significant_words for why this is needed. `strengths` and
+        `observed_approach` are dropped entry-by-entry when an entry closely
+        echoes a NOT-PASSED outcome's own wording (every entry in these two
+        fields is, by the prompt's own contract, an affirmative "the learner
+        did this" claim, so topic overlap with a failed outcome is enough --
+        no separate negation check is needed the way it is for `summary`,
+        which legitimately mixes positive and hedged/negative sentences).
+        `summary` is replaced WHOLESALE with a deterministic, outcome-derived
+        fallback only if a specific sentence both echoes a NOT-PASSED
+        outcome AND contains a completion verb AND contains no negation --
+        never edited in place, to avoid producing mangled prose.
+        """
+        not_passed = [o for o in outcomes if not o.passed]
+        if not not_passed:
+            return summary, strengths, observed_approach
+
+        id_to_outcome = {o.id: o for o in exercise.get_all_outcomes()}
+        not_passed_words = [
+            _outcome_reference_words(id_to_outcome[o.id])
+            for o in not_passed if o.id in id_to_outcome
+        ]
+        not_passed_words = [w for w in not_passed_words if w]
+        if not not_passed_words:
+            return summary, strengths, observed_approach
+
+        def _echoes_a_failed_outcome(text: str) -> bool:
+            words = _significant_words(text)
+            return any(_mentions_outcome(words, ref) for ref in not_passed_words)
+
+        clean_strengths = [s for s in strengths if not _echoes_a_failed_outcome(s)]
+        clean_observed = [s for s in observed_approach if not _echoes_a_failed_outcome(s)]
+
+        contradicts = False
+        for sentence in _split_sentences(summary):
+            words = _significant_words(sentence)
+            if words & _NEGATION_CUES:
+                continue
+            if not (words & _COMPLETION_CUES):
+                continue
+            if any(_mentions_outcome(words, ref) for ref in not_passed_words):
+                contradicts = True
+                break
+
+        final_summary = self._generate_fallback_summary(outcomes, id_to_outcome) if contradicts else summary
+        return final_summary, clean_strengths, clean_observed
+
+    @staticmethod
+    def _generate_fallback_summary(
+        outcomes: List[OutcomeResult], id_to_outcome: Dict[str, ExpectedOutcome]
+    ) -> str:
+        """Deterministic, code-generated summary built only from the scored
+        outcomes -- used exclusively as a safety net when the LLM's own
+        summary contradicts them, so it can never itself be inconsistent
+        with the score.
+        """
+        def _label(o: OutcomeResult) -> str:
+            outcome = id_to_outcome.get(o.id)
+            return outcome.description if outcome is not None else o.id
+
+        passed = [o for o in outcomes if o.passed]
+        not_passed = [o for o in outcomes if not o.passed]
+        total = round(sum(o.score for o in outcomes), 1)
+        max_total = round(sum(o.max_score for o in outcomes), 1)
+
+        parts = [f"This attempt scored {total}/{max_total}."]
+        if passed:
+            parts.append("Demonstrated this session: " + "; ".join(_label(o) for o in passed) + ".")
+        if not_passed:
+            parts.append("Not demonstrated this session: " + "; ".join(_label(o) for o in not_passed) + ".")
+        return " ".join(parts)
