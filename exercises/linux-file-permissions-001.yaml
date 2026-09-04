@@ -20,21 +20,43 @@ environment:
 expected_outcomes:
   - id: directory_created
     description: ~/secure-data exists
+    student_demonstration: >
+      The student ran a command that creates the directory (e.g. mkdir
+      secure-data) during this session. A listing or window title merely
+      showing the directory already exists is not evidence of creating it --
+      it could pre-date this session.
     type: filesystem
     weight: 20
 
   - id: file_created
     description: ~/secure-data/secrets.txt exists
+    student_demonstration: >
+      The student ran a command that creates the file (e.g. touch
+      secrets.txt, or a redirect/editor save that produces it) during this
+      session. A listing merely showing the file already exists is not
+      evidence of creating it -- it could pre-date this session.
     type: filesystem
     weight: 20
 
   - id: permissions_correct
     description: ~/secure-data/secrets.txt has mode 600
+    student_demonstration: >
+      The student ran a command that sets the mode to 600 (e.g. chmod 600
+      secrets.txt) during this session.
     type: filesystem
     weight: 40
 
   - id: permissions_verified
     description: Student made a reasonable attempt to verify permissions
+    student_demonstration: >
+      The student produced output that visibly establishes the file's
+      permissions -- e.g. a long-format directory listing (ls -l or
+      equivalent), stat, or getfacl output showing a permission mode, owner,
+      and the filename. The exact command text need not be legible (OCR is
+      often imperfect); it is the structure of the output -- a permission
+      string, owner, size, date, and filename together -- that demonstrates
+      this, not any single exact command spelling. Do not require the
+      literal text "ls -l".
     type: observed_behavior
     weight: 20
 

@@ -18,6 +18,22 @@ class Confidence(str, Enum):
     unknown = "unknown"
 
 
+class EvidenceBasis(str, Enum):
+    """What KIND of evidence backs one LLM outcome judgment -- distinguishing
+    proof the STUDENT PERFORMED an action this session from evidence that
+    only shows a resulting STATE (which may predate the session). For a
+    filesystem outcome already satisfied at baseline, state evidence can
+    never earn credit on its own; only action evidence can -- see
+    EvaluatorService._score_filesystem_outcome. Set by the LLM per judgment
+    (app.services.prompts.EVALUATION_SYSTEM_PROMPT), then enforced
+    mechanically rather than trusted from `observed` alone.
+    """
+
+    action = "action"
+    state = "state"
+    unclear = "unclear"
+
+
 class OutcomeResult(BaseModel):
     id: str
     passed: bool
@@ -72,7 +88,7 @@ class OutcomeJudgment(BaseModel):
     outcome.has_explicit_criteria — never trusted from the LLM.
     """
 
-    @field_validator("verification_state", mode="before")
+    @field_validator("verification_state", "evidence_basis", mode="before")
     @classmethod
     def normalise_verification_state(cls, v):
         if isinstance(v, str):
@@ -89,6 +105,10 @@ class OutcomeJudgment(BaseModel):
     criteria_not_met: List[str] = PydanticField(default_factory=list)
     feedback: Optional[str] = None
     criteria_implicit: bool = False  # set by result parser from outcome.has_explicit_criteria
+    # Nullable: legacy/malformed responses omit it, in which case the
+    # baseline-already-satisfied gate in EvaluatorService._score_filesystem_outcome
+    # treats it as not proven action evidence (fails closed, not open).
+    evidence_basis: Optional[EvidenceBasis] = None
 
 
 class LLMEvaluationInsights(BaseModel):

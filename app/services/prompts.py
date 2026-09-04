@@ -478,6 +478,16 @@ def format_outcomes_for_evaluation(exercise: Exercise) -> str:
                 lines.append("Note: Assess against the single implicit criterion only.")
                 lines.append("Do not invent additional sub-criteria.")
 
+            if outcome.student_demonstration:
+                lines.append("")
+                lines.append(
+                    "What counts as demonstrating this DURING THIS SESSION "
+                    "(action evidence -- see evidence_basis; a description "
+                    "above may read as an end state, but this is what doing "
+                    "it, not merely it being true, looks like):"
+                )
+                lines.append(f"  {outcome.student_demonstration}")
+
             lines.append(sep)
             blocks.append("\n".join(lines))
     return "\n".join(blocks)
@@ -619,6 +629,68 @@ currently correct? If the timeline/screenshots show no such action this
 session, mark observed=false even though verification says the state is
 fine -- that is not a contradiction, it is answering a different question.
 
+ACTION evidence vs. STATE evidence -- every outcome_judgments entry must
+classify which kind of evidence it relied on, in the "evidence_basis" field:
+- "action": the evidence shows the learner PERFORMING the relevant action
+  during this session -- a command being typed/run, a change being made, or
+  a direct on-screen result caused by that action (a confirmation message,
+  a value changing in front of the learner). This is what a
+  "student_demonstration" note on an outcome (when present, see the outcome
+  block below) describes -- follow it exactly when it is present, since it
+  is the authored, action-shaped criterion for that specific outcome.
+- "state": the evidence shows only that a resulting state currently holds --
+  a directory/file listing, a window title, a status display -- without
+  showing who produced that state or when. A listing that shows a file
+  exists is state evidence for "this file exists" but is NOT action
+  evidence for "the learner created this file": the file could have existed
+  before the session started.
+- "unclear": you cannot tell which of the above applies.
+For an outcome whose baseline state was already compliant (this is exactly
+when it appears under "Outcomes requiring your judgment" despite having a
+deterministic check -- see above), state evidence can NEVER earn credit, no
+matter how convincing it looks -- only "action" evidence can. Do not mark
+observed=true on state evidence for these; the scoring layer enforces this
+regardless of what you set observed to, so an inaccurate evidence_basis will
+produce a result that contradicts your own stated evidence -- classify it
+honestly instead of picking whichever value yields a pass.
+
+READING GARBLED / OCR-SOURCED TEXT -- do not require exact command spelling:
+Captured terminal text is frequently OCR'd from a screenshot and contains
+character-level errors (e.g. "l" read as "1" or "I", a "-" dropped, columns
+of a table folded onto separate lines). Judge OCR'd text by its STRUCTURE
+and CONTEXT, not by exact string matching:
+- A block containing a "total N" header line, a permission-mode-shaped token
+  (roughly ten characters of dashes and letters, even if some characters are
+  clearly OCR noise -- e.g. "-IW-------" is recognizable as a corrupted
+  "-rw-------"), an owner name, a file size, a date, and a filename
+  TOGETHER constitute a long-format permission listing (the output of `ls
+  -l`, `stat`, `getfacl`, or an equivalent command that visibly establishes
+  permissions) -- this is real verification evidence, whatever the exact
+  flag text reads as. Do not require the literal substring "ls -l"; accept
+  any command whose OUTPUT visibly establishes the permission mode.
+- Do NOT assume every stray "1" is a misread "l", or vice versa -- both are
+  legitimate characters in real commands and output (e.g. "ls -1" -- one
+  filename per line -- is a genuinely different, valid command from "ls
+  -l"). Decide from context: if the surrounding output has no long-format
+  columns (no permission token, owner, size, date), a lone "-1"-looking flag
+  is plausibly a real "ls -1" and shows only filenames -- that is NOT
+  permission-verification evidence. If the surrounding output DOES have
+  those long-format columns, the same ambiguous flag text is part of a
+  long listing and IS permission-verification evidence, regardless of
+  whether it reads as "-l" or "-1".
+- Apply this same tolerance consistently across every outcome you judge from
+  the same piece of evidence. If you treat a garbled token as legible enough
+  to establish one fact (e.g. reading a corrupted permission command as
+  evidence the mode was set), you must extend the same reading to other
+  facts visible in that same output (e.g. a permission listing appearing in
+  the same or adjacent lines) for any other outcome it is also relevant to.
+  Do not accept OCR noise as legible for one outcome while dismissing
+  equally-garbled, equally-adjacent text as unintelligible for a related
+  outcome -- if your two judgments disagree about the same underlying
+  evidence, your evidence text for each must name the specific, real
+  difference that justifies it (e.g. different actions, different outcomes
+  covered), never mere inconsistency in how much OCR noise you tolerated.
+
 You ARE responsible for:
 1. Judging the learner's process: whether their approach was reasonable,
    whether they took unnecessary or risky steps, whether they appeared to
@@ -629,7 +701,8 @@ You ARE responsible for:
    available; for the rest (see above), your judgment is what decides
    whether this session's activity demonstrates a state that was already
    verified. For each one, decide whether the evidence shows it was
-   observed to happen, with a brief evidence-based justification. Do not
+   observed to happen, with a brief evidence-based justification and an
+   honest evidence_basis (see ACTION vs. STATE evidence above). Do not
    guess -- if the evidence doesn't show it, mark it as not observed rather
    than assuming the learner probably did it.
 
@@ -685,6 +758,7 @@ markdown code fences, matching exactly this schema:
       "observed": true,
       "confidence": "verified | strongly_observed | inferred | unknown",
       "evidence": "string describing what in the activity supports this judgment",
+      "evidence_basis": "action | state | unclear",
       "feedback": "concise student-facing note when the outcome fails or is partial, or null"
     }
   ]

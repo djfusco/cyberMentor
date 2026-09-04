@@ -65,6 +65,18 @@ class ExpectedOutcome(BaseModel):
     evidence_requirements: List[str] = Field(default_factory=list)
     scoring_rubric: Optional[str] = None
     feedback_if_missing: Optional[str] = None
+    # Optional, explicitly ACTION-shaped description of what evidence of the
+    # student performing this outcome (not merely its resulting state being
+    # true) looks like -- distinct from `description`, which for a
+    # filesystem outcome is often phrased as an end state (e.g. "~/foo
+    # exists"). Surfaced to the LLM (see app.services.prompts.
+    # format_outcomes_for_evaluation) specifically to disambiguate a
+    # baseline-already-satisfied outcome, where state evidence alone can
+    # never prove current-session attribution -- see
+    # EvaluatorService._score_filesystem_outcome and
+    # app.services.verifier.needs_llm_attribution. Optional: when absent,
+    # the evaluator prompt's general ACTION-vs-STATE guidance still applies.
+    student_demonstration: Optional[str] = None
 
     def get_success_criteria(self) -> List[str]:
         """Explicit criteria if authored; description as single implicit fallback.

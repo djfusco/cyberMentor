@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from app.config import BASE_DIR, get_settings
-from app.models.evaluation import Confidence, EvaluationResult, LLMEvaluationInsights, OutcomeResult
+from app.models.evaluation import Confidence, EvaluationResult, EvidenceBasis, LLMEvaluationInsights, OutcomeResult
 from app.models.exercise import EnvironmentType, Exercise, ExpectedOutcome, OutcomeType, VerificationState
 from app.services.capture_manifest import ManifestWriter
 from app.services.evidence import EvidenceEvent, EvidenceService
@@ -550,13 +550,35 @@ class EvaluatorService:
         # only current-session evidence of the action can still earn credit.
         result = self._score_from_judgment(outcome, events, llm_insights, evidence_error)
         result.final_state_verified = True
-        result.demonstrated_this_session = result.passed
-        if not result.passed and not evidence_error:
+
+        # Mechanical backstop: never trust a bare observed=true here. Look up
+        # the judgment's own evidence_basis and require it to be "action" --
+        # state evidence (a listing, a window title, a status display) can
+        # prove the state exists, which nobody disputes, but not that THIS
+        # session produced it. This holds regardless of what the LLM set
+        # `observed` to, so a judgment that got the classification wrong
+        # cannot smuggle state evidence through as a pass.
+        judgment = next((j for j in llm_insights.outcome_judgments if j.id == outcome.id), None)
+        if result.passed and (judgment is None or judgment.evidence_basis != EvidenceBasis.action):
+            result.passed = False
+            result.score = 0.0
+            result.confidence = Confidence.unknown
+            result.verification_state = VerificationState.not_observed
+            result.evidence = (
+                "The evidence found only shows the resulting state (e.g. a "
+                "listing or window title), which already existed before this "
+                "session began -- it does not show the action being "
+                "performed during this session, so this is not demonstrated "
+                "this attempt."
+            )
+        elif not result.passed and not evidence_error:
             result.evidence = (
                 "This state already existed when the session started, and no "
                 "current-session activity demonstrated it again -- not "
                 "demonstrated this attempt."
             )
+
+        result.demonstrated_this_session = result.passed
         return result
 
     def _score_from_judgment(
