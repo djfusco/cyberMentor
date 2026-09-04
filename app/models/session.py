@@ -41,6 +41,17 @@ class ExerciseSession(SQLModel, table=True):
     # this field was introduced; those sessions fall back to str(id).
     capture_run_id: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
+    # JSON-serialized deterministic verification results (see
+    # app.services.verifier.VerificationDetail/serialize_verification),
+    # captured once when this session starts. At Finish, the evaluator
+    # compares this baseline against the same check re-run on the final
+    # state to tell "the student produced this during THIS session" apart
+    # from "this state already existed before they did anything" -- a
+    # deterministic PASS alone only proves the latter is possible, not which
+    # one happened. NULL for sessions created before this field existed, or
+    # when the exercise has nothing deterministic to verify; both fall back
+    # to treating any current PASS as newly demonstrated (prior behavior).
+    baseline_verification_json: Optional[str] = None
 
 
 class AppSettings(SQLModel, table=True):

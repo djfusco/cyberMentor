@@ -14,6 +14,8 @@ Two ways an outcome gets deterministic verification:
    anyone writing Python for them.
 """
 import glob
+import json
+import logging
 import os
 import re
 import stat
@@ -23,6 +25,8 @@ from typing import Any, Dict, List, Optional, Protocol
 from pydantic import BaseModel
 
 from app.models.exercise import CheckKind, CheckSpec, Exercise, OutcomeType
+
+logger = logging.getLogger(__name__)
 
 
 class VerificationDetail(BaseModel):
@@ -237,3 +241,70 @@ def run_verification(exercise: Exercise) -> Dict[str, VerificationDetail]:
     if verifier is not None:
         return verifier.verify(exercise)
     return _GENERIC_VERIFIER.verify(exercise)
+
+
+# -- Session-start baseline (stale-state attribution) -------------------------
+#
+# A deterministic check only ever proves a final state exists; it says
+# nothing about *when* that state was produced. Without a baseline, a
+# student who leaves compliant files in place from a prior attempt gets full
+# credit on a new session that did nothing at all. Capturing verification
+# once at session start (see app.routes.sessions.create_session) and
+# comparing it against the same check at Finish is what lets the evaluator
+# tell "produced this session" apart from "already there before this
+# session began" -- see EvaluatorService._score_filesystem_outcome.
+
+
+def serialize_verification(verification: Dict[str, VerificationDetail]) -> str:
+    """JSON-encode a verification result set for storage on ExerciseSession
+    (baseline_verification_json). Inverse of deserialize_verification."""
+    return json.dumps({key: detail.model_dump() for key, detail in verification.items()})
+
+
+def deserialize_verification(raw: Optional[str]) -> Dict[str, VerificationDetail]:
+    """Decode a verification result set previously stored by
+    serialize_verification. Never raises: malformed or absent data (e.g. a
+    session created before this field existed) yields {}, which callers
+    treat as "no baseline available" -- see needs_llm_attribution and
+    EvaluatorService._score_filesystem_outcome.
+    """
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.warning("Could not decode stored baseline verification: %s", exc)
+        return {}
+    result: Dict[str, VerificationDetail] = {}
+    for key, value in data.items():
+        try:
+            result[key] = VerificationDetail(**value)
+        except (TypeError, ValueError) as exc:
+            logger.warning("Could not decode baseline verification entry %r: %s", key, exc)
+    return result
+
+
+def needs_llm_attribution(
+    outcome_id: str,
+    verification: Dict[str, VerificationDetail],
+    baseline_verification: Optional[Dict[str, VerificationDetail]],
+) -> bool:
+    """True when a deterministically-checked outcome's current PASS does not,
+    by itself, prove the student produced it *this* session -- because the
+    same compliant state was already present in the baseline captured at
+    session start. In that case only current-session evidence (an LLM
+    judgment over captured activity, same as any non-deterministic outcome)
+    can still earn credit.
+
+    False whenever determinism alone already settles the outcome: no
+    verification entry, a failing check (never overridable -- see
+    EvaluatorService._score_filesystem_outcome), or a fail-at-baseline/no-baseline case
+    where the pass represents a real transition (or no baseline was
+    recorded at all, e.g. a session created before this field existed --
+    treated permissively, matching prior behavior).
+    """
+    detail = verification.get(outcome_id)
+    if detail is None or not detail.passed:
+        return False
+    baseline_detail = (baseline_verification or {}).get(outcome_id)
+    return baseline_detail is not None and baseline_detail.passed

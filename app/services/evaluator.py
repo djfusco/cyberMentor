@@ -24,7 +24,7 @@ from app.services.prompts import (
 )
 from app.services.keyframes import SelectedFrame, format_frame_captions, select_keyframes
 from app.services.token_budget import fit_to_budget
-from app.services.verifier import VerificationDetail, run_verification
+from app.services.verifier import VerificationDetail, needs_llm_attribution, run_verification
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +230,7 @@ class EvaluatorService:
         evidence_error: Optional[str] = None,
         session_id: Optional[str] = None,
         manifest: Optional[ManifestWriter] = None,
+        baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
     ) -> EvaluationResult:
         if verification is None:
             verification = run_verification(exercise)
@@ -238,14 +239,18 @@ class EvaluatorService:
             events = EvidenceService.filter_terminal_events(events)
 
         llm_insights = await self._get_llm_insights(
-            exercise, events, verification, evidence_error, session_id, manifest=manifest
+            exercise, events, verification, evidence_error, session_id, manifest=manifest,
+            baseline_verification=baseline_verification,
         )
 
         outcomes: List[OutcomeResult] = []
         for step in exercise.get_steps():
             is_real_step = step.id != "_default"
             for outcome in step.expected_outcomes:
-                result = self._score_outcome(outcome, verification, events, llm_insights, evidence_error)
+                result = self._score_outcome(
+                    outcome, verification, events, llm_insights, evidence_error,
+                    baseline_verification=baseline_verification,
+                )
                 if is_real_step:
                     result.step_id = step.id
                     result.step_title = step.title
@@ -272,6 +277,7 @@ class EvaluatorService:
         evidence_error: Optional[str] = None,
         session_id: Optional[str] = None,
         manifest: Optional[ManifestWriter] = None,
+        baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
     ) -> LLMEvaluationInsights:
         settings = get_settings()
         routing = _select_model(exercise, events, settings)
@@ -302,6 +308,7 @@ class EvaluatorService:
             prompt, per_event_truncated = build_evaluation_user_prompt(
                 exercise, events, verification, evidence_error,
                 has_images=use_vision, frame_captions=frame_captions, max_events=count,
+                baseline_verification=baseline_verification,
             )
             return EVALUATION_SYSTEM_PROMPT, prompt, per_event_truncated
 
@@ -401,7 +408,9 @@ class EvaluatorService:
         # only for those, then merge. Reuses the same screenshots/model/context.
         if not evidence_error:
             required_ids = [
-                o.id for o in exercise.get_all_outcomes() if o.id not in verification
+                o.id for o in exercise.get_all_outcomes()
+                if o.id not in verification
+                or needs_llm_attribution(o.id, verification, baseline_verification)
             ]
             returned_ids = {j.id for j in insights.outcome_judgments}
             missing_ids = [rid for rid in required_ids if rid not in returned_ids]
@@ -464,17 +473,11 @@ class EvaluatorService:
         events: List[EvidenceEvent],
         llm_insights: LLMEvaluationInsights,
         evidence_error: Optional[str] = None,
+        baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
     ) -> OutcomeResult:
         if outcome.type == OutcomeType.filesystem and outcome.id in verification:
-            detail = verification[outcome.id]
-            return OutcomeResult(
-                id=outcome.id,
-                passed=detail.passed,
-                score=outcome.weight if detail.passed else 0.0,
-                max_score=outcome.weight,
-                confidence=Confidence.verified,
-                evidence=detail.note or "Verified via filesystem check.",
-                verification_state=VerificationState.verified if detail.passed else VerificationState.incorrect,
+            return self._score_filesystem_outcome(
+                outcome, verification, baseline_verification, events, llm_insights, evidence_error
             )
 
         # observed_behavior AND process outcomes (and any filesystem outcome
@@ -483,6 +486,78 @@ class EvaluatorService:
         # fall back on, so this is the only mechanism available for anything
         # that isn't a declared filesystem check.
         return self._score_from_judgment(outcome, events, llm_insights, evidence_error)
+
+    def _score_filesystem_outcome(
+        self,
+        outcome: ExpectedOutcome,
+        verification: Dict[str, VerificationDetail],
+        baseline_verification: Optional[Dict[str, VerificationDetail]],
+        events: List[EvidenceEvent],
+        llm_insights: LLMEvaluationInsights,
+        evidence_error: Optional[str] = None,
+    ) -> OutcomeResult:
+        """Deterministic verification proves a final state exists; it says
+        nothing about whether THIS session produced it. Distinguish the two
+        facts explicitly:
+
+        - final_state_verified: does the check pass right now.
+        - demonstrated_this_session: is there current-session attribution
+          for that state, via a baseline->final transition (nonexistent ->
+          exists, incorrect -> correct) or observed evidence of the action.
+
+        A failing check is always final and never overridable by the LLM --
+        that rule is unchanged. A passing check that also represents a real
+        transition (or has no baseline to compare against, e.g. a session
+        created before baselines were captured) is deterministic credit, as
+        before. A passing check whose state already existed at session
+        start falls back to the same evidence-based judgment used for
+        outcomes with no deterministic check at all -- state alone cannot
+        prove attribution, only activity can.
+        """
+        detail = verification[outcome.id]
+        if not detail.passed:
+            return OutcomeResult(
+                id=outcome.id,
+                passed=False,
+                score=0.0,
+                max_score=outcome.weight,
+                confidence=Confidence.verified,
+                evidence=detail.note or "Verified via filesystem check.",
+                verification_state=VerificationState.incorrect,
+                final_state_verified=False,
+                demonstrated_this_session=False,
+            )
+
+        if not needs_llm_attribution(outcome.id, verification, baseline_verification):
+            # Either no baseline was recorded for this outcome (permissive
+            # fallback, matching behavior before baselines existed), or the
+            # baseline shows this outcome was NOT yet compliant at session
+            # start -- so the current pass represents a real transition
+            # produced during this session.
+            return OutcomeResult(
+                id=outcome.id,
+                passed=True,
+                score=outcome.weight,
+                max_score=outcome.weight,
+                confidence=Confidence.verified,
+                evidence=detail.note or "Verified via filesystem check.",
+                verification_state=VerificationState.verified,
+                final_state_verified=True,
+                demonstrated_this_session=True,
+            )
+
+        # The compliant state already existed before this session began --
+        # only current-session evidence of the action can still earn credit.
+        result = self._score_from_judgment(outcome, events, llm_insights, evidence_error)
+        result.final_state_verified = True
+        result.demonstrated_this_session = result.passed
+        if not result.passed and not evidence_error:
+            result.evidence = (
+                "This state already existed when the session started, and no "
+                "current-session activity demonstrated it again -- not "
+                "demonstrated this attempt."
+            )
+        return result
 
     def _score_from_judgment(
         self,

@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 from app.models.exercise import Exercise, LearningObjective
 from app.services.evidence import EvidenceEvent
-from app.services.verifier import VerificationDetail
+from app.services.verifier import VerificationDetail, needs_llm_attribution
 
 logger = logging.getLogger(__name__)
 
@@ -251,16 +251,29 @@ def format_outcomes_by_step(exercise: Exercise) -> str:
     return "\n\n".join(blocks)
 
 
-def format_judgeable_outcomes(exercise: Exercise, verification: Optional[Dict[str, VerificationDetail]]) -> str:
-    """List outcome ids that need an LLM judgment (not covered by deterministic
-    verification), so the evaluator prompt can require exactly one judgment
-    per id rather than the model inventing or skipping ids.
+def format_judgeable_outcomes(
+    exercise: Exercise,
+    verification: Optional[Dict[str, VerificationDetail]],
+    baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
+) -> str:
+    """List outcome ids that need an LLM judgment, so the evaluator prompt can
+    require exactly one judgment per id rather than the model inventing or
+    skipping ids.
+
+    Two kinds of outcome end up here:
+    1. Outcomes not covered by deterministic verification at all (as before).
+    2. A deterministically-checked outcome whose current PASS doesn't, by
+       itself, prove the student produced it THIS session -- the same
+       compliant state was already present at session start (see
+       needs_llm_attribution). Only current-session evidence can still earn
+       these credit; a failing check or a real baseline->final transition
+       never needs the LLM at all (see EvaluatorService._score_filesystem_outcome).
     """
     verification = verification or {}
     lines = [
         f"- {o.id}: {o.description}"
         for o in exercise.get_all_outcomes()
-        if o.id not in verification
+        if o.id not in verification or needs_llm_attribution(o.id, verification, baseline_verification)
     ]
     return "\n".join(lines) if lines else "(none -- every outcome is deterministically verified)"
 
@@ -587,21 +600,38 @@ STRICT EVIDENCE RULES for every outcome judgment (these prevent false credit):
   accessibility evidence (window title, AX label, OCR text) identifies it.
   Do not infer the target from coordinates.
 
-You are NOT responsible for deciding pass/fail on objective, deterministically
-verified outcomes (e.g. filesystem state) -- that has already been decided and
-is provided to you as ground truth. Do not contradict it.
+You are NOT responsible for deciding WHETHER the final state of an objective,
+deterministically verified outcome (e.g. filesystem state) is correct -- that
+fact has already been decided and is provided to you as ground truth. Do not
+contradict it: never claim a state that verification marked PASS is actually
+wrong, or vice versa.
+
+That said, a small number of deterministically-verified outcomes may still
+appear under "Outcomes requiring your judgment" below. This happens only
+when the verified state already existed before the session began, so the
+check passing proves the state exists but NOT that the learner produced it
+during THIS session -- the state fact and the demonstration fact are
+separate. For these, your judgment answers a different, narrower question
+than the verification already answered: does the observed activity show the
+learner actually PERFORMING the relevant action during this session (running
+the command, making the change), not merely that the resulting state is
+currently correct? If the timeline/screenshots show no such action this
+session, mark observed=false even though verification says the state is
+fine -- that is not a contradiction, it is answering a different question.
 
 You ARE responsible for:
 1. Judging the learner's process: whether their approach was reasonable,
    whether they took unnecessary or risky steps, whether they appeared to
    verify their own work, and producing constructive educational feedback.
 2. Providing a per-outcome judgment for EVERY outcome id listed under
-   "Outcomes requiring your judgment" below -- these are outcomes with no
-   deterministic check, so your judgment is the only signal available for
-   them. For each one, decide whether the evidence shows it was observed to
-   happen, with a brief evidence-based justification. Do not guess -- if the
-   evidence doesn't show it, mark it as not observed rather than assuming
-   the learner probably did it.
+   "Outcomes requiring your judgment" below -- for most of them there is no
+   deterministic check at all, so your judgment is the only signal
+   available; for the rest (see above), your judgment is what decides
+   whether this session's activity demonstrates a state that was already
+   verified. For each one, decide whether the evidence shows it was
+   observed to happen, with a brief evidence-based justification. Do not
+   guess -- if the evidence doesn't show it, mark it as not observed rather
+   than assuming the learner probably did it.
 
 REPORT FIELD RULES (applied when populating the JSON fields below):
 - "observed_approach" and "strengths" must only reference outcomes or
@@ -675,6 +705,7 @@ def build_evaluation_user_prompt(
     has_images: bool = False,
     frame_captions: Optional[str] = None,
     max_events: int = 80,
+    baseline_verification: Optional[dict] = None,
 ) -> Tuple[str, bool]:
     outcomes = format_outcomes_for_evaluation(exercise)
     acceptable = "\n".join(f"- {m}" for m in exercise.acceptable_methods) or "(none specified)"
@@ -719,7 +750,7 @@ Expected outcomes:
 {outcomes}
 
 Outcomes requiring your judgment (respond with exactly one outcome_judgments entry per id):
-{format_judgeable_outcomes(exercise, verification)}
+{format_judgeable_outcomes(exercise, verification, baseline_verification)}
 
 Acceptable methods:
 {acceptable}

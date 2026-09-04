@@ -32,6 +32,17 @@ class OutcomeResult(BaseModel):
     # new additive fields — safe defaults for backward compat
     verification_state: Optional[VerificationState] = None
     feedback: Optional[str] = None
+    # Only meaningful for outcomes with a deterministic (filesystem) check.
+    # final_state_verified: does the check pass RIGHT NOW (the state fact).
+    # demonstrated_this_session: is there current-session attribution for
+    # that state -- a baseline->final transition, or observed evidence of
+    # the action (the demonstration fact). These are independent: a
+    # compliant state can be verified while not demonstrated this session
+    # (stale state left over from an earlier attempt), which must score
+    # zero -- see EvaluatorService._score_filesystem_outcome. None when the
+    # distinction doesn't apply (no deterministic check for this outcome).
+    final_state_verified: Optional[bool] = None
+    demonstrated_this_session: Optional[bool] = None
 
 
 class EvaluationResult(BaseModel):

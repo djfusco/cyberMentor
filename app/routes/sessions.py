@@ -25,6 +25,7 @@ from app.services import settings_service
 from app.services.capture_manifest import ManifestWriter
 from app.services.evidence_provider import EvidenceProviderError
 from app.services.submission import build_submission_export
+from app.services.verifier import deserialize_verification, run_verification, serialize_verification
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,17 @@ async def create_session(payload: CreateSessionRequest, db: Session = Depends(ge
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # Snapshot deterministic verification BEFORE the student does anything
+    # this session, so Finish can tell "produced this session" apart from
+    # "already there from a prior attempt" -- see
+    # EvaluatorService._score_filesystem_outcome. Must never block starting
+    # a session (e.g. a transient filesystem error reading state).
+    try:
+        baseline_verification_json = serialize_verification(run_verification(exercise))
+    except Exception as exc:  # noqa: BLE001 -- baseline capture must never block starting a session
+        logger.warning("Baseline verification failed for exercise %s: %s", exercise.id, exc)
+        baseline_verification_json = None
+
     capture_run_id = str(uuid.uuid4())
     session = ExerciseSession(
         exercise_id=exercise.id,
@@ -81,6 +93,7 @@ async def create_session(payload: CreateSessionRequest, db: Session = Depends(ge
         status=SessionStatus.active,
         student_difficulty=student_difficulty,
         capture_run_id=capture_run_id,
+        baseline_verification_json=baseline_verification_json,
     )
     db.add(session)
     db.commit()
@@ -201,8 +214,10 @@ async def finish_session(session_id: int, db: Session = Depends(get_session)):
             ],
         )
 
+    baseline_verification = deserialize_verification(session.baseline_verification_json)
     result = await get_evaluator_service().evaluate(
-        exercise, events, evidence_error=evidence_error, session_id=run_id, manifest=manifest
+        exercise, events, evidence_error=evidence_error, session_id=run_id, manifest=manifest,
+        baseline_verification=baseline_verification,
     )
 
     evaluation = Evaluation(
