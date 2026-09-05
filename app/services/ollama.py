@@ -99,18 +99,33 @@ class OllamaService:
         session-query call) without creating a second OllamaService/client.
         """
         effective_timeout = timeout if timeout is not None else self.timeout
-        user_message: dict = {"role": "user", "content": _ensure_text(user_prompt)}
-        if images:
-            user_message["images"] = images
         options: dict = {"temperature": temperature}
         if num_ctx is not None:
             options["num_ctx"] = num_ctx
+
+        if images:
+            # A separate system-role message combined with an image in the
+            # user turn reproducibly crashes this model/build with a
+            # server-side "Chunk not found" 500 once the system prompt is
+            # long (observed live with the ~17K-char evaluation system
+            # prompt; a short system prompt + image did not trigger it, but
+            # merging costs nothing when short either) -- folding both into
+            # ONE user-role message with the image attached avoids it
+            # entirely while sending the model the exact same instructions.
+            # Scoped to images-only: the text-only path (including every
+            # terminal-exercise call, which never attaches images) keeps the
+            # original system+user message shape unchanged.
+            combined = _ensure_text(system_prompt) + "\n\n---\n\n" + _ensure_text(user_prompt)
+            messages = [{"role": "user", "content": combined, "images": images}]
+        else:
+            messages = [
+                {"role": "system", "content": _ensure_text(system_prompt)},
+                {"role": "user", "content": _ensure_text(user_prompt)},
+            ]
+
         payload = {
             "model": model or self.model,
-            "messages": [
-                {"role": "system", "content": _ensure_text(system_prompt)},
-                user_message,
-            ],
+            "messages": messages,
             "stream": False,
             "options": options,
         }
@@ -166,8 +181,15 @@ class OllamaService:
         num_ctx: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> LLMEvaluationInsights:
+        # Evaluation temperature is independently configurable (default 0 --
+        # deterministic/greedy decoding) via Settings.evaluation_temperature,
+        # separate from chat()'s own default (0.3) used by mentor chat /
+        # session Q&A, which is left unchanged: scoring must be repeatable
+        # for the SAME captured evidence, while mentoring can stay more
+        # conversational. See app/config.py:evaluation_temperature.
+        temperature = get_settings().evaluation_temperature
         raw = await self.chat(
-            system_prompt, user_prompt, temperature=0.2, images=images,
+            system_prompt, user_prompt, temperature=temperature, images=images,
             model=model, num_ctx=num_ctx, timeout=timeout,
         )
         parsed = self._try_parse(raw)
@@ -229,18 +251,31 @@ class OllamaService:
         return data if isinstance(data, dict) else None
 
     async def chat_json(
-        self, system_prompt: str, user_prompt: str, temperature: float = 0.2
+        self, system_prompt: str, user_prompt: str, temperature: float = 0.2,
+        images: Optional[List[str]] = None, model: Optional[str] = None,
+        num_ctx: Optional[int] = None, timeout: Optional[float] = None,
     ) -> Optional[dict]:
         """Chat, extract a JSON object, and retry once with a repair prompt if malformed.
 
         Returns a plain dict (no schema validation) or None if unrecoverable.
+        `images`/`model`/`num_ctx`/`timeout` are optional passthroughs (all
+        None by default, matching every existing caller's behavior exactly)
+        added so a lightweight vision-attached JSON call -- e.g. a targeted
+        follow-up re-check of a few screenshots -- doesn't need the full
+        LLMEvaluationInsights schema machinery in evaluate().
         """
-        raw = await self.chat(system_prompt, user_prompt, temperature=temperature)
+        raw = await self.chat(
+            system_prompt, user_prompt, temperature=temperature,
+            images=images, model=model, num_ctx=num_ctx, timeout=timeout,
+        )
         data = self._parse_json_dict(raw)
         if data is not None:
             return data
 
         logger.info("Chat JSON malformed, retrying with a repair prompt")
         repair_prompt = REPAIR_PROMPT_TEMPLATE.format(previous_response=raw)
-        raw_retry = await self.chat(system_prompt, repair_prompt, temperature=0.0)
+        raw_retry = await self.chat(
+            system_prompt, repair_prompt, temperature=0.0,
+            model=model, num_ctx=num_ctx, timeout=timeout,
+        )
         return self._parse_json_dict(raw_retry)

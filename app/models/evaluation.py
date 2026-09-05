@@ -89,6 +89,54 @@ class EvaluationResult(BaseModel):
     ai_unavailable: Optional[str] = None
 
 
+class CriterionJudgment(BaseModel):
+    """One outcome's success_criteria entry, judged individually with its own
+    evidence -- not just an unstructured pass/fail bucket. When the criterion
+    asserts an exact literal (a field name, command, value, count, or
+    identifier -- typically backtick-quoted in the authored criterion text),
+    `quote` should carry the EXACT text the model claims to have read, so the
+    scoring layer can mechanically cross-check it against captured OCR/AX
+    text rather than trusting the claim outright (see
+    EvaluatorService._evaluate_criteria). Optional and additive: an LLM
+    response that omits this per-criterion structure entirely still scores
+    via the legacy criteria_met/criteria_not_met matching on OutcomeJudgment.
+
+    Reuses EvidenceBasis (action/state/unclear) -- the same enum and values
+    as the outer OutcomeJudgment.evidence_basis, deliberately -- rather than
+    a separate text/visual vocabulary: a prior version used a different enum
+    here and the model, seeing two fields both named "evidence_basis" in the
+    same schema, filled this one with the OUTER field's values ("action"/
+    "state"), which strict enum validation then rejected and silently
+    dropped the ENTIRE structured response (observed live: 3/3 evaluation
+    runs failed this way). The lenient before-validator below is an
+    additional safety net: an unrecognized value here falls back to
+    "unclear" instead of invalidating the whole judgment.
+    """
+
+    @field_validator("evidence_basis", mode="before")
+    @classmethod
+    def _coerce_evidence_basis(cls, v):
+        if isinstance(v, str):
+            v = v.strip().lower()
+            if v not in ("action", "state", "unclear"):
+                return "unclear"
+        return v
+
+    criterion: str
+    supported: bool
+    evidence_basis: EvidenceBasis = EvidenceBasis.unclear
+    # The exact quoted text/value the model claims appears in the evidence --
+    # required (by the prompt) whenever the criterion names a specific exact
+    # value; left empty for criteria with no exact-value claim (e.g. "at
+    # least one result is returned") or genuinely visual ones.
+    quote: Optional[str] = None
+    # Which attached screenshot or timeline moment this came from -- a
+    # 1-based image index (as captioned in the prompt) or an ISO timestamp.
+    # Free text; used only for diagnostics, never parsed for scoring.
+    frame_reference: Optional[str] = None
+    note: Optional[str] = None
+
+
 class OutcomeJudgment(BaseModel):
     """The LLM's per-outcome judgment for a non-filesystem (observed_behavior
     or process) outcome. For enriched labs, also carries structured criterion
@@ -111,6 +159,11 @@ class OutcomeJudgment(BaseModel):
     verification_state: Optional[VerificationState] = None  # required in enriched labs; nullable for legacy
     criteria_met: List[str] = PydanticField(default_factory=list)
     criteria_not_met: List[str] = PydanticField(default_factory=list)
+    # Structured, per-criterion judgments -- preferred over criteria_met/
+    # criteria_not_met when present (see EvaluatorService._evaluate_criteria).
+    # Empty by default: an LLM/response that never populates this falls back
+    # to the legacy string-list matching unchanged.
+    criterion_judgments: List[CriterionJudgment] = PydanticField(default_factory=list)
     feedback: Optional[str] = None
     criteria_implicit: bool = False  # set by result parser from outcome.has_explicit_criteria
     # Nullable: legacy/malformed responses omit it, in which case the

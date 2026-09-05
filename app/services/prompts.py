@@ -807,6 +807,16 @@ markdown code fences, matching exactly this schema:
       "verification_state": "verified | partially_verified | attempted | not_observed | incorrect | unverifiable",
       "criteria_met": ["criterion text that is supported by evidence"],
       "criteria_not_met": ["criterion text that is not supported"],
+      "criterion_judgments": [
+        {
+          "criterion": "the exact criterion text being judged (copy it verbatim from the outcome block)",
+          "supported": true,
+          "evidence_basis": "action | state | unclear (same meaning as the outcome-level evidence_basis below, judged for THIS ONE criterion specifically)",
+          "quote": "the EXACT text/value you read, ONLY when this criterion names a specific field name, command, value, count, or identifier -- copy precisely what you actually saw, character for character, even if it differs from what the criterion names; null/omit for criteria with no exact-value claim",
+          "frame_reference": "which screenshot (its number) or timestamp this came from, or null",
+          "note": "optional short note, or null"
+        }
+      ],
       "observed": true,
       "confidence": "verified | strongly_observed | inferred | unknown",
       "evidence": "string describing what in the activity supports this judgment",
@@ -815,6 +825,23 @@ markdown code fences, matching exactly this schema:
     }
   ]
 }
+
+REQUIRED: for every enriched outcome (one with authored success criteria,
+listed under "Success criteria — evaluate EACH independently" in that
+outcome's block), "criterion_judgments" must contain exactly one entry per
+listed criterion -- do not omit any, do not merge several into one entry.
+For any criterion naming an exact value (a field name, command, literal
+string, count, or identifier -- typically shown in backticks, e.g. "the
+field `src_ip` appears"), you MUST put your own verbatim reading of what
+actually appears in "quote" -- do not copy the criterion's own expected
+value into "quote" as if that proves it; state what you actually read, even
+if it is a different value than the criterion names. Marking such a
+criterion "supported": true without a matching, actually-observed "quote"
+is treated as unsupported regardless of what you write elsewhere. This is
+mechanically re-checked against the captured text evidence -- a claimed
+quote that never actually appears in that evidence is discarded and the
+criterion is scored not-met, independent of "observed" or
+"verification_state" on the outcome as a whole.
 
 Include exactly one entry in "outcome_judgments" for every id listed under
 "Outcomes requiring your judgment" -- no more, no fewer. If the observed
@@ -962,6 +989,39 @@ required schema. Here is what you returned:
 
 Return ONLY a corrected, valid JSON object matching the required schema.
 No prose, no markdown code fences.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Targeted follow-up evidence check -- used by EvaluatorService for success
+# criteria the main evaluation pass could not verify (no relevant screenshot
+# was selected for them, or captured OCR/AX text was too sparse to trust an
+# "absent" reading either way). Deliberately generic and deliberately does
+# NOT quote the criterion's own expected exact value anywhere in the
+# question -- the caller neutralizes each criterion (backtick content
+# replaced with a placeholder) before it ever reaches this prompt, so a
+# match can only come from the model independently reading the screenshots,
+# never from parroting a value it was fed. See "Never award exact-text
+# credit solely because the model repeated the expected field names from
+# the prompt."
+# ---------------------------------------------------------------------------
+
+TARGETED_FOLLOWUP_SYSTEM_PROMPT = """You are answering narrow factual questions about a set of screenshots from one
+learner's session. For each numbered question, report EXACTLY what text,
+field name, or value is visible in the screenshots that is relevant to it --
+quote precisely what appears on screen, character for character. Do not
+guess, and do not assume any particular expected answer -- some questions
+may have no expected answer in mind at all. If nothing relevant to a
+question is visible in any of the attached screenshots, answer exactly
+"not visible" for that question. Respond with ONLY a single JSON object, no
+prose before or after, and no markdown code fences, matching exactly this
+schema:
+
+{
+  "answers": ["answer to question 1", "answer to question 2", ...]
+}
+
+Include exactly one answer per numbered question, in order.
 """
 
 

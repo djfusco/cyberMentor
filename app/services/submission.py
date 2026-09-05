@@ -52,6 +52,11 @@ def build_submission_export(
         "student_name": session.student_name,
         "started_at": session.started_at.isoformat() if session.started_at else None,
         "ended_at": session.ended_at.isoformat() if session.ended_at else None,
+        # Top-level, easy-to-spot flag for an instructor scanning the raw
+        # export -- the full detail is also in evaluation.ai_unavailable
+        # (nested below), but a reviewer should not have to know that field
+        # exists just to notice this attempt's score is not a real result.
+        "evaluation_status": "unavailable" if evaluation.ai_unavailable else "complete",
         "evaluation": evaluation.model_dump(mode="json"),
     }
 

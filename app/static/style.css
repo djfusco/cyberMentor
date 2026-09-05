@@ -242,6 +242,10 @@ a { color: var(--accent); text-decoration: none; }
 .outcome .icon { font-size: 16px; margin-right: 8px; }
 .outcome.pass .icon { color: var(--good); }
 .outcome.fail .icon { color: var(--bad); }
+/* Unresolved: an evaluator/capture-infrastructure limitation (verification_state
+   "unverifiable"), not a scored failure -- deliberately neutral, not red. */
+.outcome.unresolved .icon { color: var(--muted); }
+.outcome.unresolved { border-style: dashed; }
 .outcome .confidence {
   float: right;
   font-size: 12px;

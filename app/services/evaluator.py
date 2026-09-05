@@ -9,8 +9,9 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from app.config import BASE_DIR, get_settings
 from app.models.evaluation import (
@@ -27,10 +28,25 @@ from app.services.evidence import EvidenceEvent, EvidenceService
 from app.services.ollama import OllamaError, OllamaService
 from app.services.prompts import (
     EVALUATION_SYSTEM_PROMPT,
+    TARGETED_FOLLOWUP_SYSTEM_PROMPT,
     build_evaluation_user_prompt,
     build_missing_judgments_prompt,
 )
-from app.services.keyframes import SelectedFrame, format_frame_captions, select_keyframes
+from app.services.keyframes import (
+    SelectedFrame,
+    format_frame_captions,
+    select_keyframes,
+    select_keyframes_with_coverage,
+)
+from app.services.text_relevance import (
+    backtick_literals,
+    build_text_corpus,
+    distinctive_word_sets,
+    normalize_literal,
+    ocr_text_available,
+    overlap_score,
+    significant_words,
+)
 from app.services.token_budget import fit_to_budget
 from app.services.verifier import (
     EvidenceFact,
@@ -99,6 +115,17 @@ EVALUATION_MIN_IMAGES_FLOOR = 2
 # the same oversized request twice. See _get_llm_insights.
 EVALUATION_RETRY_FRAME_DIVISOR = 2
 EVALUATION_RETRY_EVENT_DIVISOR = 2
+
+# Maximum screenshots attached to the ONE targeted follow-up call (see
+# _run_targeted_followup) that re-checks exact-value success criteria the
+# main pass could not verify -- either no relevant evidence was selected for
+# them, or captured OCR/AX text was too sparse this session to trust an
+# "absent" reading. Small and separate from EVALUATION_MAX_VISION_FRAMES: a
+# handful of screenshots spread across the WHOLE session (not
+# criterion-targeted -- there was no reliable way to pre-identify the right
+# one lexically) is enough for the model to spot an answer if it's visible
+# anywhere, without paying for a second full evaluation-sized request.
+EVALUATION_FOLLOWUP_MAX_FRAMES = 4
 
 # Used by session-query routing (app/services/session_query.py), NOT by
 # evaluation routing. Session Q&A is interactive and cost-sensitive, so it
@@ -288,6 +315,61 @@ class _ModelRouting:
     reason: str
 
 
+class CriterionEvidenceState(str, Enum):
+    """The scoring layer's own, mechanically-derived conclusion for ONE
+    success criterion -- never trusted blindly from the model's self-report.
+    Only the first three may contribute to a COMPLETED assessment decision
+    (a genuine pass or fail); the last two mean the assessment could not
+    reach a conclusion at all and must never be scored as if the learner
+    failed (see EvaluatorService._evaluate_criteria / _score_from_judgment).
+    """
+
+    # Positively confirmed: the judgment's claim (or the targeted follow-up's
+    # independent reading) matches the criterion, and for an exact-value
+    # criterion, matches with genuine corroborating evidence.
+    supported = "supported"
+    # Evidence was evaluated (corpus was sufficient, or a targeted follow-up
+    # ran) and it shows something DIFFERENT than the criterion requires.
+    contradicted = "contradicted"
+    # Evidence was evaluated and the claimed text/value genuinely does not
+    # appear anywhere in the complete captured session.
+    not_found_in_session = "not_found_in_session"
+    # No relevant evidence was ever selected/considered for this criterion
+    # (selection failure) -- the assessment never actually looked.
+    not_evaluated = "not_evaluated"
+    # Relevant evidence exists but is of insufficient quality to confirm OR
+    # deny an exact-value claim (e.g. this session captured no substantive
+    # OCR/AX text at all, so a corpus miss proves nothing either way), and a
+    # targeted follow-up (if attempted) did not resolve it either.
+    unavailable = "unavailable"
+
+
+# States that may contribute to a COMPLETED (genuinely decided) assessment.
+# Never `not_evaluated`/`unavailable` -- see CriterionEvidenceState.
+_COMPLETING_CRITERION_STATES = frozenset({
+    CriterionEvidenceState.supported,
+    CriterionEvidenceState.contradicted,
+    CriterionEvidenceState.not_found_in_session,
+})
+
+
+@dataclass
+class _CriteriaEvaluation:
+    """Result of mechanically evaluating one outcome's success_criteria
+    against a judgment -- see EvaluatorService._evaluate_criteria. This is
+    the scoring layer's OWN conclusion, derived from (and where necessary,
+    overriding) the model's self-reported criteria_met/criteria_not_met."""
+
+    fully_satisfied: bool
+    met: List[str]
+    not_met: List[str]
+    # Criteria whose evidence state is not_evaluated/unavailable -- selection
+    # failure or insufficient evidence quality, NEVER treated as a failure.
+    pending: List[str]
+    rejected_claims: List[str]
+    states: Dict[str, CriterionEvidenceState]
+
+
 def _has_sufficient_text_evidence(events: List[EvidenceEvent]) -> bool:
     """True if enough substantive (non-trivial) text was captured to judge a
     visual exercise from text/AX/OCR alone, without needing screenshots."""
@@ -430,10 +512,11 @@ class EvaluatorService:
         # re-derive the same fact from noisy OCR text.
         evidence_facts = extract_evidence_facts(exercise, events, verification)
 
-        llm_insights, ai_unavailable_reason = await self._get_llm_insights(
+        llm_insights, ai_unavailable_reason, uncovered_criteria, followup_answers = await self._get_llm_insights(
             exercise, events, verification, evidence_error, session_id, manifest=manifest,
             baseline_verification=baseline_verification, evidence_facts=evidence_facts,
         )
+        ocr_sufficient = ocr_text_available(events)
 
         outcomes: List[OutcomeResult] = []
         for step in exercise.get_steps():
@@ -443,6 +526,8 @@ class EvaluatorService:
                     outcome, verification, events, llm_insights, evidence_error,
                     baseline_verification=baseline_verification, evidence_facts=evidence_facts,
                     ai_unavailable_reason=ai_unavailable_reason,
+                    uncovered_criteria=set(uncovered_criteria.get(outcome.id, [])),
+                    followup_answers=followup_answers, ocr_sufficient=ocr_sufficient,
                 )
                 if is_real_step:
                     result.step_id = step.id
@@ -469,17 +554,19 @@ class EvaluatorService:
 
     def _select_evaluation_frames(
         self, exercise: Exercise, events: List[EvidenceEvent], session_id: Optional[str], frame_budget: int,
-    ) -> "tuple[List[str], List[SelectedFrame]]":
-        """Outcome-relevance-ranked frame selection, bounded by both count
-        and total byte size. Replaces blind even-temporal spreading for
-        evaluation: see select_keyframes(..., outcomes=...) and
-        _bound_images_by_bytes.
+    ) -> "tuple[List[str], List[SelectedFrame], Dict[str, List[str]]]":
+        """Criterion-COVERAGE-ranked frame selection, bounded by both count
+        and total byte size -- see select_keyframes_with_coverage(...) and
+        _bound_images_by_bytes. Also returns which (outcome_id -> [criterion
+        text]) pairs received NO relevant evidence at all, so the scoring
+        layer can mark them not_evaluated (never a silent learner failure)
+        instead of pretending the packet covered everything.
         """
         outcomes = exercise.get_all_outcomes()
-        selected_frames = select_keyframes(events, frame_budget, outcomes=outcomes)
+        selected_frames, uncovered = select_keyframes_with_coverage(events, frame_budget, outcomes)
         images, kept_frames = _encode_frames(selected_frames, session_id)
         images, kept_frames = _bound_images_by_bytes(images, kept_frames, EVALUATION_MAX_IMAGE_BYTES)
-        return images, kept_frames
+        return images, kept_frames, uncovered
 
     async def _call_ollama(
         self, system_prompt: str, prompt: str, images: List[str], model: str,
@@ -494,6 +581,92 @@ class EvaluatorService:
             system_prompt, prompt, num_ctx=context_size, timeout=timeout,
         )
 
+    @staticmethod
+    def _evenly_sample_paths(paths: List[str], budget: int) -> List[str]:
+        n = len(paths)
+        if n <= budget:
+            return paths
+        if budget <= 1:
+            return [paths[-1]]
+        indices = sorted({round(i * (n - 1) / (budget - 1)) for i in range(budget)})
+        return [paths[i] for i in indices]
+
+    async def _run_targeted_followup(
+        self,
+        pending: List["tuple[str, str]"],
+        events: List[EvidenceEvent],
+        session_id: Optional[str],
+        model: str,
+        context_size: int,
+        timeout: float,
+    ) -> Dict[str, str]:
+        """ONE additional vision call asking, in NEUTRAL terms (no expected
+        value is ever named), what is actually visible relevant to each
+        pending exact-value criterion. Attaches a handful of screenshots
+        spread across the WHOLE session -- there is no reliable way to
+        lexically pre-identify which specific frame shows the answer for a
+        text-sparse capture (that is exactly why these criteria are
+        pending), so the model is given breadth instead of a single guess.
+
+        Returns {criterion_text: reported_answer}; entries are ABSENT for
+        any item the model didn't answer or that came back malformed --
+        callers must not treat a missing entry as either confirmation or
+        denial. `pending` is a list of (outcome_id, criterion_text) --
+        outcome_id is accepted for future diagnostics but not otherwise used
+        here (the answer is keyed purely by criterion_text since a criterion
+        already uniquely identifies itself within one exercise's outcomes).
+        """
+        if not pending:
+            return {}
+        all_paths: List[str] = []
+        seen: set = set()
+        for e in events:
+            if e.frame_path and e.frame_path not in seen:
+                seen.add(e.frame_path)
+                all_paths.append(e.frame_path)
+        if not all_paths:
+            return {}
+        sample_paths = self._evenly_sample_paths(all_paths, EVALUATION_FOLLOWUP_MAX_FRAMES)
+        images = _encode_images(sample_paths, session_id)
+        if not images:
+            return {}
+
+        questions = []
+        for i, (_oid, criterion) in enumerate(pending, 1):
+            neutral = re.sub(r"`[^`]+`", "[a specific value]", criterion)
+            questions.append(f"{i}. {neutral}")
+
+        user_prompt = (
+            f"Attached are {len(images)} screenshots from one learner's session, "
+            "spread across the session and not necessarily all relevant.\n\n"
+            "For EACH numbered item below, report exactly what is visible in "
+            "the screenshots relevant to it.\n\n" + "\n".join(questions) +
+            "\n\nRespond with ONLY the JSON object described in the system prompt, "
+            f"with exactly {len(pending)} entries in \"answers\", in order."
+        )
+
+        try:
+            data = await self.ollama.chat_json(
+                TARGETED_FOLLOWUP_SYSTEM_PROMPT, user_prompt,
+                temperature=get_settings().evaluation_temperature,
+                images=images, model=model, num_ctx=context_size, timeout=timeout,
+            )
+        except OllamaError as exc:
+            logger.warning(
+                "Targeted follow-up evidence check failed (%s); %d criteria remain unavailable",
+                exc, len(pending),
+            )
+            return {}
+
+        if not data or not isinstance(data.get("answers"), list):
+            return {}
+        answers = data["answers"]
+        result: Dict[str, str] = {}
+        for (_oid, criterion), answer in zip(pending, answers):
+            if isinstance(answer, str) and answer.strip():
+                result[criterion] = answer
+        return result
+
     async def _get_llm_insights(
         self,
         exercise: Exercise,
@@ -504,33 +677,52 @@ class EvaluatorService:
         manifest: Optional[ManifestWriter] = None,
         baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
         evidence_facts: Optional[List[EvidenceFact]] = None,
-    ) -> "tuple[LLMEvaluationInsights, Optional[str]]":
-        """Returns (insights, ai_unavailable_reason). ai_unavailable_reason is
-        None on success (including a successful retry); otherwise it names
-        why the LLM call could not be completed even after one retry with a
-        smaller evidence packet -- callers must score affected outcomes as
-        unavailable/unscored, never as a silent 0 that reads like the learner
-        didn't do the work (see _score_from_judgment).
+    ) -> "tuple[LLMEvaluationInsights, Optional[str], Dict[str, List[str]], Dict[str, str]]":
+        """Returns (insights, ai_unavailable_reason, uncovered_criteria,
+        followup_answers).
+
+        ai_unavailable_reason is None on success (including a successful
+        retry); otherwise it names why the LLM call could not be completed
+        even after one retry with a smaller evidence packet -- callers must
+        score affected outcomes as unavailable/unscored, never as a silent 0
+        that reads like the learner didn't do the work (see
+        _score_from_judgment).
+
+        uncovered_criteria maps outcome_id -> [criterion text] for every
+        success criterion that received NO relevant evidence in the selected
+        packet at all (see select_keyframes_with_coverage) -- the scoring
+        layer must treat these as not_evaluated, never as a failure.
+
+        followup_answers maps criterion text -> the targeted follow-up's
+        independently-observed answer, for exact-value criteria the main
+        pass could not verify (uncovered, or insufficient OCR/AX text this
+        session) -- see _run_targeted_followup. Empty when no follow-up was
+        needed or it could not be completed.
         """
         settings = get_settings()
         routing = _select_model(exercise, events, settings)
         use_vision, model, reason = routing.use_vision, routing.model, routing.reason
 
         outcomes = exercise.get_all_outcomes()
-        # Budget ~EVALUATION_FRAMES_PER_OUTCOME frames per outcome, capped at
-        # EVALUATION_MAX_VISION_FRAMES -- a 3-outcome exercise budgets 6
-        # frames, not the full ceiling; a much larger exercise is still
-        # capped. Nothing here is specific to any one exercise or vocabulary.
-        frame_budget = min(
-            EVALUATION_MAX_VISION_FRAMES,
-            max(1, len(outcomes)) * EVALUATION_FRAMES_PER_OUTCOME,
-        ) if outcomes else EVALUATION_MAX_VISION_FRAMES
+        # Budget ~1 frame per authored success criterion (not per outcome --
+        # coverage of individual criteria is what evidence selection now
+        # optimizes for, see select_keyframes_with_coverage), capped at
+        # EVALUATION_MAX_VISION_FRAMES so a much larger exercise is still
+        # bounded. A criterion may still receive a 2nd frame when it has
+        # multiple strong candidates (see MAX_FRAMES_PER_CRITERION in
+        # keyframes.py); this is only the TARGET, not a hard per-criterion
+        # cap. Nothing here is specific to any one exercise or vocabulary.
+        total_criteria = sum(len(o.get_success_criteria()) for o in outcomes) if outcomes else 0
+        frame_budget = min(EVALUATION_MAX_VISION_FRAMES, max(1, total_criteria)) if outcomes else EVALUATION_MAX_VISION_FRAMES
 
         images: List[str] = []
         frame_captions: Optional[str] = None
         selected_frames: List[SelectedFrame] = []
+        uncovered_criteria: Dict[str, List[str]] = {}
         if use_vision:
-            images, selected_frames = self._select_evaluation_frames(exercise, events, session_id, frame_budget)
+            images, selected_frames, uncovered_criteria = self._select_evaluation_frames(
+                exercise, events, session_id, frame_budget,
+            )
             if not images:
                 use_vision, model = False, settings.ollama_model
                 reason = "screenshots could not be read; falling back to text-only"
@@ -670,7 +862,7 @@ class EvaluatorService:
                         f"AI-based process analysis was unavailable ({exc2}), and no activity evidence "
                         "was captured either. Scoring below relies on deterministic verification only."
                     )
-                return LLMEvaluationInsights(summary=summary), str(exc2)
+                return LLMEvaluationInsights(summary=summary), str(exc2), uncovered_criteria, {}
 
         # Vision models (e.g. llava) frequently return a coherent summary but
         # omit the structured outcome_judgments array, or fill it only partially.
@@ -695,7 +887,32 @@ class EvaluatorService:
                     model=model, num_ctx=context_size, timeout=eval_timeout,
                 )
 
-        return insights, None
+        # Targeted follow-up: for any EXACT-VALUE criterion (backtick-quoted
+        # literal) that either received no evidence in the main packet at
+        # all, or whose absence from the text corpus cannot be trusted
+        # (this session captured no substantive OCR/AX text to confirm
+        # absence one way or the other -- see ocr_text_available), ask ONE
+        # additional neutral question rather than silently leaving it
+        # unresolved. Never fires for non-exact-value criteria (a visual
+        # claim with nothing to quote) or when OCR text this session WAS
+        # substantive enough that a corpus miss is trustworthy on its own.
+        followup_answers: Dict[str, str] = {}
+        if use_vision and not evidence_error:
+            ocr_sufficient = ocr_text_available(events)
+            pending: List["tuple[str, str]"] = []
+            for outcome in outcomes:
+                outcome_uncovered = set(uncovered_criteria.get(outcome.id, []))
+                for criterion in outcome.get_success_criteria():
+                    if not backtick_literals(criterion):
+                        continue
+                    if criterion in outcome_uncovered or not ocr_sufficient:
+                        pending.append((outcome.id, criterion))
+            if pending:
+                followup_answers = await self._run_targeted_followup(
+                    pending, events, session_id, model, context_size, eval_timeout,
+                )
+
+        return insights, None, uncovered_criteria, followup_answers
 
     async def _fill_missing_judgments(
         self,
@@ -772,11 +989,16 @@ class EvaluatorService:
         baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
         evidence_facts: Optional[List[EvidenceFact]] = None,
         ai_unavailable_reason: Optional[str] = None,
+        uncovered_criteria: Optional[Set[str]] = None,
+        followup_answers: Optional[Dict[str, str]] = None,
+        ocr_sufficient: bool = True,
     ) -> OutcomeResult:
         if outcome.type == OutcomeType.filesystem and outcome.id in verification:
             return self._score_filesystem_outcome(
                 outcome, verification, baseline_verification, events, llm_insights, evidence_error,
                 evidence_facts, ai_unavailable_reason=ai_unavailable_reason,
+                uncovered_criteria=uncovered_criteria, followup_answers=followup_answers,
+                ocr_sufficient=ocr_sufficient,
             )
 
         # observed_behavior AND process outcomes (and any filesystem outcome
@@ -787,6 +1009,8 @@ class EvaluatorService:
         return self._score_from_judgment(
             outcome, events, llm_insights, evidence_error, evidence_facts,
             ai_unavailable_reason=ai_unavailable_reason,
+            uncovered_criteria=uncovered_criteria, followup_answers=followup_answers,
+            ocr_sufficient=ocr_sufficient,
         )
 
     def _score_filesystem_outcome(
@@ -799,6 +1023,9 @@ class EvaluatorService:
         evidence_error: Optional[str] = None,
         evidence_facts: Optional[List[EvidenceFact]] = None,
         ai_unavailable_reason: Optional[str] = None,
+        uncovered_criteria: Optional[Set[str]] = None,
+        followup_answers: Optional[Dict[str, str]] = None,
+        ocr_sufficient: bool = True,
     ) -> OutcomeResult:
         """Deterministic verification proves a final state exists; it says
         nothing about whether THIS session produced it. Distinguish the two
@@ -855,6 +1082,8 @@ class EvaluatorService:
         result = self._score_from_judgment(
             outcome, events, llm_insights, evidence_error, evidence_facts,
             ai_unavailable_reason=ai_unavailable_reason,
+            uncovered_criteria=uncovered_criteria, followup_answers=followup_answers,
+            ocr_sufficient=ocr_sufficient,
         )
         result.final_state_verified = True
 
@@ -900,55 +1129,243 @@ class EvaluatorService:
         return result
 
     @staticmethod
-    def _criteria_fully_satisfied(outcome: ExpectedOutcome, judgment: OutcomeJudgment) -> bool:
-        """An ENRICHED outcome (explicit success_criteria authored in the
-        YAML) earns full credit only when the judgment's own criteria
-        assessment mechanically supports it -- observed=true alone is never
-        sufficient (that was the bug: a loosely-justified observed=true
-        converted straight into full points regardless of how many of the
-        outcome's own success criteria the judgment actually addressed).
+    def _criterion_claimed_support(
+        criterion: str, judgment: OutcomeJudgment, distinctive_words: "Optional[Set[str]]" = None,
+    ) -> "tuple[Optional[bool], Optional[str]]":
+        """What did the judgment claim for ONE specific authored criterion?
+        Returns (claimed_supported, quote). claimed_supported is None when
+        the criterion was never addressed at all (neither confirmed nor
+        denied) -- that counts as unmet (missing criterion judgments fail
+        closed), handled by the caller.
 
-        Requires ALL THREE, independent of what the LLM set verification_state
-        to on its own -- a model that mislabels a partial result as "verified"
-        is not trusted just because it said so:
-        - the judgment's own state is exactly "verified" (per
-          EVALUATION_SYSTEM_PROMPT's own definition: "Do NOT use verified if
-          any required criterion is unsatisfied");
-        - zero criteria were placed in criteria_not_met;
-        - every one of the outcome's authored success_criteria was addressed
-          (present in criteria_met or criteria_not_met) -- a judgment that
-          silently only discusses 1 of 3 required criteria fails closed
-          rather than being read as "the other two must be fine".
+        Prefers a structured CriterionJudgment (matched by normalized
+        criterion text) over the legacy criteria_met/criteria_not_met string
+        lists, so a response using either shape scores identically.
 
-        Legacy outcomes (no explicit success_criteria -- has_explicit_criteria
-        is False) never reach this method; see the has_explicit_criteria
-        guard at the call site, which preserves the original observed=true
-        behavior for them exactly.
+        `distinctive_words`: this criterion's significant words that do NOT
+        also appear in any OTHER criterion of the same outcome (see
+        _evaluate_criteria) -- used only by the tier-3 fallback below.
         """
-        if judgment.verification_state != VerificationState.verified:
-            return False
-        if judgment.criteria_not_met:
-            return False
-        required = len(outcome.success_criteria)
-        addressed = len(judgment.criteria_met) + len(judgment.criteria_not_met)
-        return addressed >= required
+        norm_c = normalize_literal(criterion)
+        # Tier 1: structured criterion_judgments, near-exact text match.
+        for cj in judgment.criterion_judgments:
+            norm_cj = normalize_literal(cj.criterion)
+            if norm_cj == norm_c or norm_c in norm_cj or norm_cj in norm_c:
+                return cj.supported, cj.quote
+
+        # Tier 2: legacy criteria_met/criteria_not_met, near-exact text match.
+        def _matches(entry: str) -> bool:
+            norm_e = normalize_literal(entry)
+            return norm_e == norm_c or norm_c in norm_e or norm_e in norm_c
+
+        if any(_matches(e) for e in judgment.criteria_met):
+            return True, None
+        if any(_matches(e) for e in judgment.criteria_not_met):
+            return False, None
+
+        # Tier 3: fallback for a judgment that PARAPHRASES or MERGES several
+        # criteria into one summarized statement instead of copying the
+        # authored text verbatim -- a real, observed llava:latest failure
+        # mode despite the prompt explicitly asking for exact criterion text
+        # ("prompt instructions alone are insufficient" applies here too).
+        # Associate this criterion with whichever candidate statement (from
+        # EITHER list) shares the most significant words with it -- see
+        # _best_overlap_claim for the exact acceptance rule.
+        candidates: List["tuple[str, bool, Optional[str]]"] = [
+            (cj.criterion, cj.supported, cj.quote) for cj in judgment.criterion_judgments
+        ]
+        candidates += [(e, True, None) for e in judgment.criteria_met]
+        candidates += [(e, False, None) for e in judgment.criteria_not_met]
+        return EvaluatorService._best_overlap_claim(criterion, distinctive_words or set(), candidates)
+
+    # Minimum shared significant words to associate a paraphrased statement
+    # with a criterion when NONE of the shared words are distinctive to that
+    # specific criterion (see below) -- requiring 2+ generic shared words
+    # keeps a single incidental common term (e.g. two sibling criteria of
+    # the SAME outcome both happening to mention "total") from cross-
+    # crediting the wrong one; genuine paraphrases of the SAME criterion
+    # reliably share several content words even when generic ones are
+    # excluded.
+    _FALLBACK_OVERLAP_MIN_WORDS = 2
 
     @staticmethod
-    def _incomplete_criteria_evidence(outcome: ExpectedOutcome, judgment: OutcomeJudgment) -> str:
+    def _best_overlap_claim(
+        criterion: str, distinctive_words: "Set[str]", candidates: List["tuple[str, bool, Optional[str]]"],
+    ) -> "tuple[Optional[bool], Optional[str]]":
+        """A candidate statement is accepted as addressing `criterion` if it
+        shares >=2 significant words with it, OR shares just ONE word that
+        is DISTINCTIVE to this criterion (i.e. not also present in any
+        sibling criterion of the same outcome). The single-distinctive-word
+        allowance is what lets a short, on-topic paraphrase (e.g. "the
+        upload summary shows success" for a criterion about an "upload
+        completion message") register as a real match even though it only
+        shares one content word with the criterion's own wording -- while
+        still refusing to cross-credit on a single GENERIC word two
+        criteria happen to share (that word is, by construction, excluded
+        from being "distinctive").
+        """
+        criterion_words = significant_words(criterion)
+        best: Optional["tuple[int, bool, Optional[str]]"] = None
+        for text, supported, quote in candidates:
+            overlap_words = criterion_words & significant_words(text)
+            if not overlap_words:
+                continue
+            if len(overlap_words) < EvaluatorService._FALLBACK_OVERLAP_MIN_WORDS and not (overlap_words & distinctive_words):
+                continue
+            score = len(overlap_words)
+            if best is None or score > best[0]:
+                best = (score, supported, quote)
+        if best is None:
+            return None, None
+        return best[1], best[2]
+
+    def _evaluate_criteria(
+        self,
+        outcome: ExpectedOutcome,
+        judgment: OutcomeJudgment,
+        events: List[EvidenceEvent],
+        uncovered_criteria: Optional[Set[str]] = None,
+        followup_answers: Optional[Dict[str, str]] = None,
+        ocr_sufficient: bool = True,
+    ) -> "_CriteriaEvaluation":
+        """Mechanically derive per-criterion evidence STATE -- the SCORING
+        layer's own conclusion, never trusted blindly from the model's
+        self-report. See CriterionEvidenceState for the five possible states
+        and which three may complete an assessment.
+
+        For a criterion naming an exact literal value (a field name,
+        command, value, count, or identifier -- conventionally
+        backtick-quoted, e.g. "the field `src_ip` appears"):
+        - If NO relevant evidence was ever selected for it (`criterion in
+          uncovered_criteria`) or this session captured no substantive
+          OCR/AX text at all (`not ocr_sufficient`) -- a text-corpus miss
+          proves nothing either way -- the claim is neither trusted NOR
+          rejected outright. If the targeted follow-up (see
+          _run_targeted_followup) independently observed a value, that
+          value (never the model's own possibly-parroted quote) decides
+          supported/contradicted; otherwise the criterion is `unavailable`.
+        - Otherwise (evidence WAS selected and OCR this session was
+          substantive), a claim of support is trusted ONLY if that exact
+          literal (case/whitespace-normalized, no fuzzy/semantic matching --
+          `dest_ip` is not `dst_ip`) is found verbatim in the corpus; a miss
+          here IS meaningful (`not_found_in_session`), since the corpus was
+          actually capable of confirming it.
+
+        Criteria with no backtick-quoted literal (e.g. "at least one result
+        is returned", or a genuinely visual claim like a graph shape) are
+        never subject to any corpus/follow-up check -- there is no exact
+        value to verify, so the model's own claim (structured or legacy)
+        is trusted as-is; `not_evaluated` still applies if evidence was
+        never selected for it at all.
+        """
+        uncovered_criteria = uncovered_criteria or set()
+        followup_answers = followup_answers or {}
+        corpus = build_text_corpus(events)
+        met: List[str] = []
+        not_met: List[str] = []
+        pending: List[str] = []
+        rejected: List[str] = []
+        states: Dict[str, CriterionEvidenceState] = {}
+        per_criterion_words = [significant_words(c) for c in outcome.success_criteria]
+        per_criterion_distinctive = distinctive_word_sets(per_criterion_words)
+
+        for i, criterion in enumerate(outcome.success_criteria):
+            distinctive_words = per_criterion_distinctive[i]
+            claimed_supported, quote = self._criterion_claimed_support(criterion, judgment, distinctive_words)
+            literals = backtick_literals(criterion)
+            is_uncovered = criterion in uncovered_criteria
+
+            if not literals:
+                if claimed_supported is True:
+                    state = CriterionEvidenceState.supported
+                elif is_uncovered:
+                    # No relevant evidence was ever selected for this
+                    # criterion -- a selection failure, not a checked-and-
+                    # failed claim.
+                    state = CriterionEvidenceState.not_evaluated
+                else:
+                    # Evidence WAS selected/available; the judgment either
+                    # explicitly denied it or silently never addressed it --
+                    # both are a genuine (checked) non-confirmation, not a
+                    # selection failure, so this stays a real not-met rather
+                    # than being read as merely incomplete.
+                    state = CriterionEvidenceState.not_found_in_session
+            else:
+                followup_answer = followup_answers.get(criterion)
+                if followup_answer is not None:
+                    norm_answer = normalize_literal(followup_answer)
+                    if not norm_answer or norm_answer in ("not visible", "none", "n/a"):
+                        state = CriterionEvidenceState.unavailable
+                    elif all(normalize_literal(lit) in norm_answer for lit in literals):
+                        state = CriterionEvidenceState.supported
+                    else:
+                        state = CriterionEvidenceState.contradicted
+                        rejected.append(
+                            f'"{criterion}" -- a targeted follow-up check independently observed '
+                            f"\"{followup_answer}\", not the expected {', '.join(literals)} -- treated as contradicted."
+                        )
+                elif is_uncovered or not ocr_sufficient:
+                    # No selected evidence, or this session's OCR/AX text is
+                    # too sparse to trust an absence reading either way --
+                    # the follow-up either wasn't attempted or didn't
+                    # resolve this specific criterion.
+                    state = CriterionEvidenceState.unavailable
+                elif claimed_supported:
+                    missing = [lit for lit in literals if normalize_literal(lit) not in corpus]
+                    if missing:
+                        state = CriterionEvidenceState.not_found_in_session
+                        seen_note = f' (model quoted: "{quote}")' if quote else ""
+                        rejected.append(
+                            f'"{criterion}" was claimed supported, but '
+                            f"{', '.join(missing)} not found verbatim in captured evidence text{seen_note} -- rejected."
+                        )
+                    else:
+                        state = CriterionEvidenceState.supported
+                else:
+                    # claimed_supported is False, or None (never addressed
+                    # despite evidence being available and OCR being
+                    # sufficient) -- both are a genuine checked
+                    # non-confirmation, not a selection failure.
+                    state = CriterionEvidenceState.not_found_in_session
+
+            states[criterion] = state
+            if state == CriterionEvidenceState.supported:
+                met.append(criterion)
+            elif state in (CriterionEvidenceState.not_evaluated, CriterionEvidenceState.unavailable):
+                pending.append(criterion)
+            else:
+                not_met.append(criterion)
+
+        fully = not not_met and not pending and len(met) == len(outcome.success_criteria)
+        return _CriteriaEvaluation(
+            fully_satisfied=fully, met=met, not_met=not_met, pending=pending,
+            rejected_claims=rejected, states=states,
+        )
+
+    @staticmethod
+    def _criteria_evidence_text(judgment: OutcomeJudgment, evaluation: "_CriteriaEvaluation") -> str:
         """Student/instructor-facing explanation for why an outcome the model
         marked observed=true still did not earn full credit -- must name the
-        actual gap (which criteria are unmet, or how many were never
-        addressed) so feedback never contradicts the score by looking like a
-        generic failure when real partial progress was found."""
+        actual gap (unmet criteria, pending/unresolved criteria, and any
+        specific claim mechanically rejected for an unsupported exact value)
+        so feedback never contradicts the score by looking like a generic
+        failure when real partial progress was found, and never reads as a
+        confident failure when the true issue is missing/insufficient
+        evidence rather than a checked-and-failed criterion."""
         parts: List[str] = [judgment.evidence] if judgment.evidence else []
-        if judgment.criteria_not_met:
-            parts.append("Unmet success criteria: " + "; ".join(judgment.criteria_not_met))
-        required = len(outcome.success_criteria)
-        addressed = len(judgment.criteria_met) + len(judgment.criteria_not_met)
-        missing = max(0, required - addressed)
-        if missing:
+        if evaluation.not_met:
+            parts.append("Unmet success criteria: " + "; ".join(evaluation.not_met))
+        if evaluation.pending:
             parts.append(
-                f"{missing} of {required} required success criteria were not addressed by the judgment."
+                "Could not be assessed (no relevant evidence selected, or evidence quality was "
+                "insufficient to confirm or deny): " + "; ".join(evaluation.pending)
+            )
+        if evaluation.rejected_claims:
+            parts.append("Rejected unsupported claims: " + " ".join(evaluation.rejected_claims))
+        total = len(evaluation.met) + len(evaluation.not_met) + len(evaluation.pending)
+        if evaluation.not_met or evaluation.pending:
+            parts.append(
+                f"{len(evaluation.met)} of {total} required success criteria were confirmed supported."
             )
         if not parts:
             parts.append("Not all required success criteria were supported by the available evidence.")
@@ -962,6 +1379,9 @@ class EvaluatorService:
         evidence_error: Optional[str] = None,
         evidence_facts: Optional[List[EvidenceFact]] = None,
         ai_unavailable_reason: Optional[str] = None,
+        uncovered_criteria: Optional[Set[str]] = None,
+        followup_answers: Optional[Dict[str, str]] = None,
+        ocr_sufficient: bool = True,
     ) -> OutcomeResult:
         if evidence_error:
             return OutcomeResult(
@@ -1009,7 +1429,7 @@ class EvaluatorService:
             # criteria -- nothing more granular was ever authored to check)
             # keep the original behavior unchanged: observed=true earns full
             # credit outright.
-            if not outcome.has_explicit_criteria or self._criteria_fully_satisfied(outcome, judgment):
+            if not outcome.has_explicit_criteria:
                 return OutcomeResult(
                     id=outcome.id,
                     passed=True,
@@ -1020,25 +1440,64 @@ class EvaluatorService:
                     verification_state=judgment.verification_state,
                     feedback=judgment.feedback,
                 )
-            # The model claims the behavior was observed, but its own
-            # criteria assessment does not support full credit (some
-            # required criteria unmet, or not all were addressed). The YAML
-            # defines no numeric partial-credit scale for this outcome, so
-            # this fails closed at 0 rather than inventing a fraction --
-            # partial criteria coverage must never silently become full
-            # credit, and a missing criterion judgment must fail closed.
+            # Enriched outcome: the SCORING layer, not the model, derives the
+            # final state from mechanically-validated per-criterion results
+            # (see _evaluate_criteria) -- a self-reported observed=true or
+            # verification_state="verified" is never sufficient on its own.
+            criteria_evaluation = self._evaluate_criteria(
+                outcome, judgment, events, uncovered_criteria=uncovered_criteria,
+                followup_answers=followup_answers, ocr_sufficient=ocr_sufficient,
+            )
+            if criteria_evaluation.pending and not criteria_evaluation.not_met:
+                # Every unresolved criterion is pending (not_evaluated /
+                # unavailable) and NONE were genuinely checked-and-failed --
+                # this outcome's assessment is INCOMPLETE, not a confident
+                # failure. Never present this as a learner failure: the
+                # evidence to decide it one way or the other simply was not
+                # selected, or was of insufficient quality to confirm or
+                # deny an exact-value claim.
+                return OutcomeResult(
+                    id=outcome.id,
+                    passed=False,
+                    score=0.0,
+                    max_score=outcome.weight,
+                    confidence=Confidence.unknown,
+                    evidence=self._criteria_evidence_text(judgment, criteria_evaluation),
+                    verification_state=VerificationState.unverifiable,
+                    feedback=judgment.feedback,
+                )
+            if criteria_evaluation.fully_satisfied:
+                return OutcomeResult(
+                    id=outcome.id,
+                    passed=True,
+                    score=outcome.weight,
+                    max_score=outcome.weight,
+                    confidence=Confidence.strongly_observed,
+                    evidence=judgment.evidence or "Observed in captured screenshots/activity.",
+                    verification_state=judgment.verification_state,
+                    feedback=judgment.feedback,
+                )
+            # Some required criteria are unmet, unaddressed, or were claimed
+            # met on an exact-value quote that the captured evidence does not
+            # actually contain. The YAML defines no numeric partial-credit
+            # scale for this outcome, so this fails closed at 0 rather than
+            # inventing a fraction -- partial criteria coverage (or an
+            # unsupported exact-value claim) must never silently become full
+            # credit.
             return OutcomeResult(
                 id=outcome.id,
                 passed=False,
                 score=0.0,
                 max_score=outcome.weight,
                 confidence=Confidence.unknown,
-                evidence=self._incomplete_criteria_evidence(outcome, judgment),
+                evidence=self._criteria_evidence_text(judgment, criteria_evaluation),
                 verification_state=judgment.verification_state,
                 feedback=judgment.feedback,
             )
 
         if judgment is None:
+            outcome_uncovered = (uncovered_criteria or set()) & set(outcome.success_criteria)
+            all_uncovered = bool(outcome.success_criteria) and outcome_uncovered == set(outcome.success_criteria)
             if ai_unavailable_reason:
                 # The LLM call itself failed (even after one retry with a
                 # smaller evidence packet) -- this is an EVALUATOR failure,
@@ -1051,12 +1510,35 @@ class EvaluatorService:
                     "failure, not evidence that the learner did not complete this outcome."
                 )
                 verification_state = VerificationState.unverifiable
+            elif all_uncovered:
+                # No relevant evidence was selected for ANY of this
+                # outcome's success criteria -- a selection gap, not
+                # evidence the learner didn't complete it, and consistent
+                # with why the model returned no judgment at all: it never
+                # saw anything to judge.
+                evidence = (
+                    "No relevant evidence was selected for any of this outcome's success criteria, "
+                    "so it could not be evaluated this attempt. This reflects a selection gap, not "
+                    "evidence that the learner did not complete this outcome."
+                )
+                verification_state = VerificationState.unverifiable
             elif not events:
                 evidence = "There was insufficient captured evidence to confidently evaluate this behavior."
                 verification_state = None
             else:
-                evidence = "The AI evaluator did not return a judgment for this outcome."
-                verification_state = None
+                # Evidence was selected and the LLM call itself did not error
+                # or return unparseable JSON overall, yet no judgment for
+                # THIS outcome id came back even after the missing-judgment
+                # follow-up (see _fill_missing_judgments). This is still an
+                # evaluator gap, not observed evidence of failure -- must not
+                # read as a confident fail (verification_state=None rendered
+                # as "failed" in the UI/report). See _get_llm_insights.
+                evidence = (
+                    "The AI evaluator did not return a judgment for this outcome, even after a "
+                    "follow-up request specifically asking for it. This reflects an evaluator gap, "
+                    "not evidence that the learner did not complete this outcome."
+                )
+                verification_state = VerificationState.unverifiable
             return OutcomeResult(
                 id=outcome.id,
                 passed=False,

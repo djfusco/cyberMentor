@@ -242,3 +242,57 @@ async def finish_session(session_id: int, db: Session = Depends(get_session)):
             "details": result.model_dump(),
         },
     }
+
+
+@router.post("/{session_id}/retry-evaluation")
+async def retry_evaluation(session_id: int, db: Session = Depends(get_session)):
+    """Re-run evaluation for an already-completed session from its PERSISTED
+    evidence (capture_sessions/<run_id>/events.jsonl) -- no new capture
+    session is started, and stop_session() is never called again (the
+    capture already ended when this session was finished).
+
+    Exists so a student whose evaluation came back "unavailable" (e.g. the
+    AI evaluator timed out, even after the built-in retry with a smaller
+    payload) is never stuck redoing the entire exercise just to get a real
+    score for work that was already captured. Replaces any existing
+    Evaluation row for this session, mirroring finish_session's persistence.
+    """
+    session = _session_or_404(db, session_id)
+    if session.status != SessionStatus.completed:
+        raise HTTPException(
+            status_code=400, detail="Only a completed session's evaluation can be retried"
+        )
+
+    exercise = get_exercise_service().get_exercise(session.exercise_id)
+    if exercise is None:
+        raise HTTPException(status_code=404, detail=f"Exercise '{session.exercise_id}' not found")
+
+    run_id = session.capture_run_id or str(session.id)
+    events = await get_evidence_service().get_persisted_session_activity(run_id)
+
+    baseline_verification = deserialize_verification(session.baseline_verification_json)
+    result = await get_evaluator_service().evaluate(
+        exercise, events, session_id=run_id, baseline_verification=baseline_verification,
+    )
+
+    existing = db.exec(select(Evaluation).where(Evaluation.session_id == session.id)).all()
+    for row in existing:
+        db.delete(row)
+    evaluation = Evaluation(
+        session_id=session.id,
+        score=result.score,
+        summary=result.summary,
+        evaluation_json=result.model_dump_json(),
+    )
+    db.add(evaluation)
+    db.commit()
+    db.refresh(evaluation)
+
+    return {
+        "session": session,
+        "evaluation": {
+            "score": evaluation.score,
+            "summary": evaluation.summary,
+            "details": result.model_dump(),
+        },
+    }

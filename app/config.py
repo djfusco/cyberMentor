@@ -47,6 +47,18 @@ class Settings(BaseSettings):
     # without also raising the lighter mentor-chat timeout. Override with
     # EVALUATION_TIMEOUT_SECONDS.
     evaluation_timeout_seconds: float = 180.0
+    # Sampling temperature for Finish-time evaluation LLM calls ONLY --
+    # independent of mentor chat / session Q&A, which keep their own
+    # OllamaService.chat() default (0.3) unchanged. Scoring must be
+    # repeatable: the same captured evidence should not sometimes pass and
+    # sometimes fail an outcome depending on sampling noise. Default is 0
+    # (deterministic/greedy decoding) rather than the previously-hardcoded
+    # 0.2 -- observed in live testing to materially change how thoroughly a
+    # local vision model itemizes per-criterion judgments run to run at 0.2,
+    # which is exactly the kind of instability an assessment result must not
+    # have. Override with EVALUATION_TEMPERATURE if a specific deployment
+    # wants sampling variety at the cost of repeatability.
+    evaluation_temperature: float = 0.0
     # Per-call timeout for SessionQueryService LLM calls only (the
     # "Ask About This Session" feature). Separate from
     # ollama_timeout_seconds so a slower, evidence-grounded session query can

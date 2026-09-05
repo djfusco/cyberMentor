@@ -184,12 +184,46 @@ async function loadResults() {
   }
 }
 
+// Re-evaluates the ALREADY-CAPTURED evidence for this session (no new
+// capture session is started) -- offered on the results page when
+// evaluation was unavailable (e.g. a model timeout), so a student is never
+// stuck with a stale "unavailable" result without redoing the exercise.
+async function retryEvaluation() {
+  const sessionId = document.body.dataset.sessionId;
+  const btn = document.getElementById('retry-evaluation-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Retrying...';
+  }
+  try {
+    const res = await fetch(`/api/sessions/${sessionId}/retry-evaluation`, { method: 'POST' });
+    if (!res.ok) {
+      alert('Retry failed -- please try again in a moment.');
+      if (btn) { btn.disabled = false; btn.textContent = 'Retry Evaluation'; }
+      return;
+    }
+    await loadResults();
+  } catch (err) {
+    alert('Retry failed -- please try again in a moment.');
+    if (btn) { btn.disabled = false; btn.textContent = 'Retry Evaluation'; }
+  }
+}
+
 function renderOutcomeItem(o) {
-  const icon = o.passed ? '\u2713' : (o.confidence === 'inferred' ? '\u25B3' : '\u2717');
-  return `<li class="outcome ${o.passed ? 'pass' : 'fail'}">
+  // verification_state "unverifiable" means -- by its own definition (see
+  // app.services.prompts.EVALUATION_SYSTEM_PROMPT) -- "the capture/evaluation
+  // mechanism could not reliably determine completion", i.e. an evaluator or
+  // capture-infrastructure limitation, NOT evidence the student failed. This
+  // covers both an evidence_error and an ai_unavailable (e.g. model timeout)
+  // outcome uniformly: render it as unresolved, never as a failure.
+  const unresolved = !o.passed && o.verification_state === 'unverifiable';
+  const icon = unresolved ? '\u2022' : (o.passed ? '\u2713' : (o.confidence === 'inferred' ? '\u25B3' : '\u2717'));
+  const cssClass = unresolved ? 'unresolved' : (o.passed ? 'pass' : 'fail');
+  const scoreText = unresolved ? 'not yet scored' : `${o.score}/${o.max_score} pts`;
+  return `<li class="outcome ${cssClass}">
     <span class="confidence">${o.confidence}</span>
     <span class="icon">${icon}</span>
-    <strong>${o.id}</strong> - ${o.score}/${o.max_score} pts
+    <strong>${o.id}</strong> - ${scoreText}
     <p class="evidence">${escapeHtml(o.evidence)}</p>
   </li>`;
 }
@@ -233,9 +267,33 @@ function renderResults(data) {
       </div>`
     : '';
 
+  // ai_unavailable means the AI evaluator itself could not complete scoring
+  // (e.g. a model timeout, even after the built-in retry with a smaller
+  // payload) -- distinct from evidence_error (evidence RETRIEVAL failing).
+  // Both are evaluator/infrastructure problems, not evidence of student
+  // failure, so neither may present a final "/100" total or a failure mark
+  // on the outcomes that could not be resolved (see renderOutcomeItem).
+  const evaluationUnavailable = Boolean(details.ai_unavailable);
+  const aiUnavailableBanner = evaluationUnavailable
+    ? `<div class="evidence-error-banner">
+        <strong>Evaluation unavailable</strong> -- the AI evaluator could not complete scoring for this
+        attempt, even after automatically retrying with a smaller evidence packet. This is NOT a
+        reflection of your work: the outcomes below marked "not yet scored" simply could not be
+        resolved yet.<br>${escapeHtml(details.ai_unavailable)}
+        <div style="margin-top:0.5em">
+          <button type="button" id="retry-evaluation-btn" class="button" onclick="retryEvaluation()">Retry Evaluation</button>
+        </div>
+      </div>`
+    : '';
+
+  const scoreBanner = (evaluationUnavailable || details.evidence_error)
+    ? `<div class="score-banner">Evaluation incomplete</div>`
+    : `<div class="score-banner">Score: ${data.score} / 100</div>`;
+
   return `
-    <div class="score-banner">Score: ${data.score} / 100</div>
+    ${scoreBanner}
     ${evidenceErrorBanner}
+    ${aiUnavailableBanner}
     <h3>Outcome Results</h3>
     ${outcomeRows}
     <h3>Summary</h3>
