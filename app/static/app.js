@@ -704,10 +704,17 @@ async function loadSubmissionsTable() {
             : s.signature_valid === false
             ? '<span class="sig-bad">INVALID</span>'
             : '<span class="sig-unknown">unverifiable</span>';
+        // A submission imported from an attempt where the AI evaluator could
+        // not obtain valid judgments must not show its numeric score as if
+        // it were a legitimate result -- see build_submission_export's
+        // "evaluation_status" field (mirrored onto Submission at import).
+        const scoreCell = s.evaluation_status === 'unavailable'
+          ? '<span class="sig-unknown">Unavailable</span>'
+          : s.score;
         return `<tr>
           <td>${escapeHtml(s.student_name || 'Unknown')}</td>
           <td>${escapeHtml(s.exercise_title)}</td>
-          <td>${s.score}</td>
+          <td>${scoreCell}</td>
           <td>${sig}</td>
           <td><a href="/instructor/submissions/${s.id}">View</a></td>
         </tr>`;

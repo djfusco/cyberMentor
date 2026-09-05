@@ -131,6 +131,7 @@ def import_submission(
         score=evaluation.score,
         summary=evaluation.summary,
         evaluation_json=evaluation.model_dump_json(),
+        evaluation_status=bundle.get("evaluation_status") or ("unavailable" if evaluation.ai_unavailable else "complete"),
         signature_valid=signature_valid,
         signature_note=signature_note,
         source_filename=source_filename,

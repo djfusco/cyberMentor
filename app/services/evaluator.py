@@ -7,20 +7,26 @@ verification, the LLM's opinion is never used to decide pass/fail.
 import base64
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+from pydantic import ValidationError
+
 from app.config import BASE_DIR, get_settings
 from app.models.evaluation import (
     Confidence,
+    CriterionJudgment,
     EvaluationResult,
     EvidenceBasis,
     LLMEvaluationInsights,
     OutcomeJudgment,
     OutcomeResult,
+    VisualCriterionState,
+    VisualOutcomeJudgment,
 )
 from app.models.exercise import EnvironmentType, Exercise, ExpectedOutcome, OutcomeType, VerificationState
 from app.services.capture_manifest import ManifestWriter
@@ -29,8 +35,10 @@ from app.services.ollama import OllamaError, OllamaService
 from app.services.prompts import (
     EVALUATION_SYSTEM_PROMPT,
     TARGETED_FOLLOWUP_SYSTEM_PROMPT,
+    VISUAL_OUTCOME_SYSTEM_PROMPT,
     build_evaluation_user_prompt,
     build_missing_judgments_prompt,
+    build_visual_outcome_scoring_prompt,
 )
 from app.services.keyframes import (
     SelectedFrame,
@@ -126,6 +134,45 @@ EVALUATION_RETRY_EVENT_DIVISOR = 2
 # one lexically) is enough for the model to spot an answer if it's visible
 # anywhere, without paying for a second full evaluation-sized request.
 EVALUATION_FOLLOWUP_MAX_FRAMES = 4
+
+# --- Per-outcome visual evaluation (replaces the combined multi-outcome
+# vision call for GUI/SIEM/web exercises -- see
+# EvaluatorService._evaluate_visual_outcomes). Each outcome gets its OWN
+# dedicated scoring call with only its own criteria/evidence/schema, so the
+# frame budget below is PER OUTCOME, not shared across the whole exercise
+# the way EVALUATION_MAX_VISION_FRAMES is for the legacy combined path. ---
+
+# Screenshots attached to ONE outcome's dedicated scoring call: its own
+# lexically-relevant frames plus, when one or more of its criteria had zero
+# lexical candidates, additional deterministically-ranked candidates (see
+# _discover_candidate_frames). Kept small since the prompt/schema per call
+# is now tiny -- measured at ~1-3s per call with 1-2 images against the
+# installed llava:latest build, vs. 50-75s (and frequent outright failure)
+# for the old combined 6-8 image, multi-outcome request.
+VISUAL_OUTCOME_MAX_FRAMES = 8
+# Smaller context window than the legacy combined call (VISION_NUM_CTX) --
+# a single-outcome prompt plus a handful of images fits comfortably well
+# under this, and a smaller num_ctx measurably speeds up local inference.
+VISUAL_OUTCOME_NUM_CTX = 8192
+# If a single outcome's scoring call fails (transport error) or returns a
+# response that does not validate against VisualOutcomeJudgment, retry
+# EXACTLY ONCE for that outcome ONLY, with half its images -- never resend
+# the same request, and never re-run any OTHER outcome's already-successful
+# call (see IMPLEMENT A SMALLER PER-OUTCOME VISUAL EVALUATION PATH, item 6).
+VISUAL_OUTCOME_RETRY_FRAME_DIVISOR = 2
+# Total attempts per outcome (initial + retries) before giving up: attempt 1
+# is the full packet; attempt 2 (if needed) halves it (the one allowed
+# evidence reduction); every attempt after that reuses that SAME halved
+# packet, purely to absorb the transient Ollama-server flakiness observed
+# directly against this build (a freshly-touched image combination
+# occasionally fails with a transport-level error -- confirmed by direct,
+# repeated reproduction to be non-deterministic, not tied to a specific
+# image or to the `format` request property -- and then succeeds on a
+# later identical attempt) -- never a further-reduced packet. Each attempt
+# now costs ~1-5s (vs. 50-75s for the legacy combined call), so a higher
+# ceiling than a single retry is cheap; still bounded so a genuinely down
+# Ollama instance fails fast rather than looping indefinitely.
+VISUAL_OUTCOME_MAX_ATTEMPTS = 5
 
 # Used by session-query routing (app/services/session_query.py), NOT by
 # evaluation routing. Session Q&A is interactive and cost-sensitive, so it
@@ -512,10 +559,25 @@ class EvaluatorService:
         # re-derive the same fact from noisy OCR text.
         evidence_facts = extract_evidence_facts(exercise, events, verification)
 
-        llm_insights, ai_unavailable_reason, uncovered_criteria, followup_answers = await self._get_llm_insights(
-            exercise, events, verification, evidence_error, session_id, manifest=manifest,
-            baseline_verification=baseline_verification, evidence_facts=evidence_facts,
-        )
+        # Route visual (GUI/SIEM/web) exercises through the smaller,
+        # per-outcome scoring path -- see _get_visual_llm_insights. Terminal
+        # exercises, exercises with no vision model configured, and any
+        # session with no screenshots at all keep using the EXISTING
+        # combined-call path unchanged (see _select_model) -- this repair is
+        # scoped to visual evaluation only, per "the terminal evaluator must
+        # remain unchanged". evidence_error also forces the legacy path: an
+        # evidence-retrieval failure means there is nothing to route on.
+        use_visual_pipeline = not evidence_error and _select_model(exercise, events, get_settings()).use_vision
+        if use_visual_pipeline:
+            llm_insights, ai_unavailable_reason, uncovered_criteria, followup_answers = await self._get_visual_llm_insights(
+                exercise, events, verification, session_id, manifest=manifest,
+                baseline_verification=baseline_verification,
+            )
+        else:
+            llm_insights, ai_unavailable_reason, uncovered_criteria, followup_answers = await self._get_llm_insights(
+                exercise, events, verification, evidence_error, session_id, manifest=manifest,
+                baseline_verification=baseline_verification, evidence_facts=evidence_facts,
+            )
         ocr_sufficient = ocr_text_available(events)
 
         outcomes: List[OutcomeResult] = []
@@ -535,9 +597,25 @@ class EvaluatorService:
                 outcomes.append(result)
         total_score = sum(o.score for o in outcomes)
 
-        summary, strengths, observed_approach = self._reconcile_narrative(
-            exercise, outcomes, llm_insights.summary, llm_insights.strengths, llm_insights.observed_approach,
-        )
+        if use_visual_pipeline:
+            # The visual pipeline runs no narrative-generation call at all
+            # (see _evaluate_visual_outcomes/_score_visual_outcome -- each
+            # call asks only for this outcome's own criteria judgments, no
+            # summary/strengths/improvements). Build the report
+            # DETERMINISTICALLY from the already-scored outcomes instead of
+            # asking an LLM to freely narrate: "Generate the narrative
+            # report only after scoring. It must not participate in
+            # determining the score." Reuses the SAME deterministic
+            # generator _reconcile_narrative already falls back to when an
+            # LLM summary contradicts the score -- here it is simply the
+            # ONLY summary, never a fallback.
+            id_to_outcome = {o.id: o for o in exercise.get_all_outcomes()}
+            summary = self._generate_fallback_summary(outcomes, id_to_outcome)
+            strengths, observed_approach = [], []
+        else:
+            summary, strengths, observed_approach = self._reconcile_narrative(
+                exercise, outcomes, llm_insights.summary, llm_insights.strengths, llm_insights.observed_approach,
+            )
 
         return EvaluationResult(
             score=round(total_score, 1),
@@ -567,6 +645,430 @@ class EvaluatorService:
         images, kept_frames = _encode_frames(selected_frames, session_id)
         images, kept_frames = _bound_images_by_bytes(images, kept_frames, EVALUATION_MAX_IMAGE_BYTES)
         return images, kept_frames, uncovered
+
+    # -- Per-outcome visual evaluation ---------------------------------------
+
+    @staticmethod
+    def _screen_diff(event: Optional[EvidenceEvent]) -> float:
+        """Parse the Rust capture provider's own screen-change magnitude
+        (e.g. "Screen content changed (difference=0.09)") from an event's
+        synthesized text. Generic and already-captured for any GUI/web/SIEM
+        exercise -- never specific to one application or field name. Used
+        only to RANK which additional candidate frames to show a per-outcome
+        scoring call when lexical selection found zero candidates for one of
+        its criteria (see _discover_candidate_frames); it never by itself
+        decides relevance or a score -- only the scoring call does that.
+        """
+        if event is None or event.type != "screen_change":
+            return 0.0
+        match = re.search(r"difference=([\d.]+)", event.text or "")
+        return float(match.group(1)) if match else 0.0
+
+    @staticmethod
+    def _discover_candidate_frames(
+        events: List[EvidenceEvent], exclude_paths: Set[str], budget: int,
+    ) -> List[str]:
+        """Bounded, deterministic evidence-discovery fallback for when
+        lexical/OCR-based selection found zero candidates for a success
+        criterion (see select_keyframes_with_coverage's `uncovered`) --
+        "zero lexical candidates" must never end evidence discovery for a
+        visual exercise.
+
+        An LLM-based discovery pass (a numbered contact-sheet image asking
+        "which frame numbers are relevant", and per-frame open-ended
+        captioning) was implemented and measured directly against the
+        installed llava:latest build before this was written, and found
+        unreliable for this specific task: open-ended captioning fabricated
+        specific incorrect on-screen details, and relevance-selection
+        queries returned either "every frame" or "no frame" almost
+        regardless of actual content -- while the SAME model reliably
+        answers a narrow, fully-specified question when given full criteria
+        context (see _score_visual_outcome / VISUAL_OUTCOME_SYSTEM_PROMPT).
+        So discovery here is a deterministic SELECTION step only (never a
+        model call, never a score) -- candidates are ranked by their own
+        screen-change magnitude (a materially different on-screen state is
+        a better proxy for "worth inspecting" than blind temporal spacing),
+        falling back to even sampling across whatever remains so a text-
+        sparse session is still fully covered rather than only its highest-
+        diff moments. The frames this returns are then inspected at
+        readable resolution by the scoring call, which decides relevance
+        and support itself -- discovery and scoring remain separate steps.
+        """
+        by_path: Dict[str, EvidenceEvent] = {}
+        order: List[str] = []
+        for e in events:
+            if e.frame_path and e.frame_path not in by_path:
+                by_path[e.frame_path] = e
+                order.append(e.frame_path)
+        candidates = [p for p in order if p not in exclude_paths]
+        if not candidates or budget <= 0:
+            return []
+        ranked = sorted(candidates, key=lambda p: -EvaluatorService._screen_diff(by_path[p]))
+        # A big screen-change is a strong signal that SOMETHING changed just
+        # before that frame -- but the frame showing the settled/decisive
+        # content (a result finished rendering, a page finished loading) is
+        # frequently the NEXT captured frame, not the high-diff one itself
+        # (measured directly: the frame immediately after a big change
+        # consistently carried more decisive content than the change frame
+        # alone). So each high-diff anchor also pulls in its immediately
+        # FOLLOWING frame, spending half the budget on anchors and the rest
+        # on their neighbors, before falling back to even sampling.
+        half = max(1, (budget + 1) // 2)
+        chosen: List[str] = []
+        chosen_set: Set[str] = set()
+        for anchor in ranked[:half]:
+            if len(chosen) >= budget:
+                break
+            if anchor not in chosen_set:
+                chosen.append(anchor)
+                chosen_set.add(anchor)
+            idx = order.index(anchor)
+            # Up to 2 FOLLOWING frames, not just 1: a settled/decisive state
+            # after a big change (a query resolving, a page finishing load)
+            # sometimes takes more than one captured frame to fully render.
+            for offset in (1, 2):
+                if idx + offset >= len(order) or len(chosen) >= budget:
+                    break
+                nxt = order[idx + offset]
+                if nxt not in exclude_paths and nxt not in chosen_set:
+                    chosen.append(nxt)
+                    chosen_set.add(nxt)
+        if len(chosen) < budget:
+            remaining = [p for p in candidates if p not in chosen_set]
+            chosen += EvaluatorService._evenly_sample_paths(remaining, budget - len(chosen))
+        chosen_set = set(chosen)
+        return [p for p in order if p in chosen_set]
+
+    @staticmethod
+    def _convert_visual_judgment(outcome: ExpectedOutcome, judgment: VisualOutcomeJudgment) -> OutcomeJudgment:
+        """Convert a per-outcome VisualOutcomeJudgment (the small, dedicated
+        response schema) into the existing OutcomeJudgment/CriterionJudgment
+        shape, so the EXISTING, already-proven scoring machinery
+        (_evaluate_criteria, _score_from_judgment, exact-value grounding,
+        the five-state CriterionEvidenceState) applies completely unchanged.
+        Only the EVIDENCE-ACQUISITION layer is new; scoring logic is reused.
+        """
+        criterion_judgments: List[CriterionJudgment] = []
+        for cr in judgment.criteria:
+            if cr.state == VisualCriterionState.supported:
+                supported, unverifiable = True, False
+            elif cr.state == VisualCriterionState.contradicted:
+                supported, unverifiable = False, False
+            else:
+                supported, unverifiable = False, True
+            criterion_judgments.append(CriterionJudgment(
+                criterion=cr.criterion,
+                supported=supported,
+                unverifiable=unverifiable,
+                quote=cr.quote,
+                frame_reference=cr.frame_ref,
+                evidence_basis=EvidenceBasis.unclear,
+            ))
+        observed = any(cj.supported for cj in criterion_judgments)
+        return OutcomeJudgment(
+            id=outcome.id,
+            observed=observed,
+            evidence_basis=EvidenceBasis.unclear,
+            criterion_judgments=criterion_judgments,
+            evidence=judgment.feedback or "",
+            feedback=judgment.feedback or None,
+        )
+
+    async def _score_visual_outcome(
+        self,
+        outcome: ExpectedOutcome,
+        events: List[EvidenceEvent],
+        session_id: Optional[str],
+        model: str,
+        timeout: float,
+        manifest: Optional[ManifestWriter],
+    ) -> "tuple[Optional[OutcomeJudgment], bool, Dict[str, List[str]]]":
+        """ONE dedicated scoring call for ONE outcome: only its own success
+        criteria, its own selected evidence, and a small response schema
+        (VisualOutcomeJudgment) supplied through Ollama's real `format`
+        request property (grammar-constrained decoding, not prompt-text-only
+        -- see OllamaService.chat's `format` parameter). No unrelated
+        outcomes, no narrative report.
+
+        Returns (judgment_or_None, obtained, uncovered_criteria) --
+        `obtained` is False only when NO valid judgment could be obtained
+        for this outcome even after retrying with a smaller packet (a
+        transport failure or a response that never validates), which the
+        caller must treat as an evaluator gap for THIS outcome, never a
+        learner failure, and never grounds for re-running any OTHER
+        outcome's already-successful call.
+        """
+        criteria = outcome.get_success_criteria()
+        settings = get_settings()
+        lexical_frames, uncovered = select_keyframes_with_coverage(
+            events, VISUAL_OUTCOME_MAX_FRAMES, [outcome],
+        )
+        # When one or more of this outcome's criteria are uncovered,
+        # select_keyframes_with_coverage has already spent leftover budget
+        # on GENERIC even-temporal filler (relevance_score == 0.0) for lack
+        # of anything better lexically -- exactly the case where the
+        # deterministic discovery fallback below has a real chance of
+        # finding something more useful. Keep the genuinely-matched frames
+        # always; drop the filler (not the discovered candidates) to make
+        # room, rather than letting filler crowd out discovery.
+        if uncovered.get(outcome.id):
+            all_frames = [sf for sf in lexical_frames if sf.relevance_score > 0]
+        else:
+            all_frames = list(lexical_frames)
+        discovered_count = 0
+        remaining_budget = VISUAL_OUTCOME_MAX_FRAMES - len(all_frames)
+        if uncovered.get(outcome.id) and remaining_budget > 0:
+            # Exclude only frames already KEPT (the genuinely-relevant
+            # ones), not every frame lexical selection merely considered --
+            # a frame that was discarded as generic filler above is still a
+            # legitimate discovery candidate (and, for a short session, may
+            # be one of the only frames that exist at all).
+            already_kept = {sf.path for sf in all_frames}
+            discovered_paths = self._discover_candidate_frames(
+                events, exclude_paths=already_kept, budget=remaining_budget,
+            )
+            discovered_count = len(discovered_paths)
+            if discovered_paths:
+                frame_events = [(i, e.frame_path, e) for i, e in enumerate(events) if e.frame_path]
+                by_path = {p: e for _, p, e in frame_events}
+                for path in discovered_paths:
+                    if path in already_kept:
+                        continue
+                    ev = by_path.get(path)
+                    if ev is None:
+                        continue
+                    all_frames.append(SelectedFrame(
+                        path=path, timestamp=ev.timestamp, application=ev.application,
+                        window_title=ev.window_title, trigger_type="discovered", role="spread",
+                        matched_evidence="deterministic discovery fallback (no lexical candidate existed)",
+                    ))
+        all_frames.sort(key=lambda sf: sf.timestamp)
+
+        async def _attempt(frames: List[SelectedFrame], keep_alive: Optional[int] = None) -> "tuple[Optional[dict], List[SelectedFrame]]":
+            images, kept = _encode_frames(frames, session_id)
+            images, kept = _bound_images_by_bytes(images, kept, EVALUATION_MAX_IMAGE_BYTES, min_images=1)
+            if not images:
+                return None, kept
+            captions = format_frame_captions(kept)
+            prompt = build_visual_outcome_scoring_prompt(outcome.id, criteria, captions, outcome.description)
+            schema = VisualOutcomeJudgment.model_json_schema()
+            data = await self.ollama.chat_structured(
+                VISUAL_OUTCOME_SYSTEM_PROMPT, prompt, schema,
+                temperature=settings.evaluation_temperature, images=images,
+                model=model, num_ctx=VISUAL_OUTCOME_NUM_CTX, timeout=timeout,
+                keep_alive=keep_alive,
+            )
+            return data, kept
+
+        started = time.monotonic()
+        retry_used = False
+        attempt_frames = all_frames
+        kept_frames = all_frames
+        data: Optional[dict] = None
+        validated: Optional[VisualOutcomeJudgment] = None
+        for attempt_num in range(VISUAL_OUTCOME_MAX_ATTEMPTS):
+            is_last_attempt = attempt_num == VISUAL_OUTCOME_MAX_ATTEMPTS - 1
+            if is_last_attempt and attempt_num > 0:
+                # Last-resort recovery, tried only once other, cheaper
+                # attempts are exhausted: force a full unload+reload of the
+                # model before this final attempt. Confirmed by direct,
+                # repeated reproduction that rapid switching between
+                # DIFFERENT image sets on the same already-loaded
+                # multimodal model instance corrupts its internal image
+                # cache on this Ollama build (HTTP 500 "Chunk not found"),
+                # and that a freshly-loaded model never exhibits it. A tiny
+                # text-only, image-free ping with keep_alive=0 forces the
+                # unload cleanly (an image-bearing request that itself
+                # errors may not reach the point where keep_alive is
+                # honored), so the real attempt just after loads fresh.
+                try:
+                    await self.ollama.chat(
+                        "reset", "ok", model=model, timeout=timeout, keep_alive=0,
+                    )
+                except (OllamaError, AttributeError, TypeError) as exc:
+                    logger.warning("Visual scoring reset ping failed for outcome %s (%s)", outcome.id, exc)
+            try:
+                data, kept_frames = await _attempt(attempt_frames)
+            except OllamaError as exc:
+                # Reproducibly observed against this Ollama build: a
+                # transient server-side failure (HTTP 500, e.g. "Chunk not
+                # found") on a freshly-touched image combination that often
+                # succeeds on a subsequent attempt with the SAME or a
+                # smaller packet -- a genuine infrastructure characteristic,
+                # not a content/schema problem (see the visual-evaluation
+                # repair notes). Bounded by VISUAL_OUTCOME_MAX_ATTEMPTS so
+                # this never loops indefinitely.
+                logger.warning(
+                    "Visual scoring call failed for outcome %s, attempt %d/%d (%s)",
+                    outcome.id, attempt_num + 1, VISUAL_OUTCOME_MAX_ATTEMPTS, exc,
+                )
+                data = None
+            if data is not None:
+                try:
+                    validated = VisualOutcomeJudgment.model_validate(data)
+                    break
+                except ValidationError as exc:
+                    logger.warning(
+                        "Visual scoring response for outcome %s failed validation, attempt %d/%d (%s)",
+                        outcome.id, attempt_num + 1, VISUAL_OUTCOME_MAX_ATTEMPTS, exc,
+                    )
+                    data, validated = None, None
+            if attempt_num == 0 and len(attempt_frames) > 1:
+                # ONE reduction step only -- never resend the same oversized
+                # request twice; a further attempt (if any remain) reuses
+                # this same smaller packet purely to absorb transient
+                # infrastructure flakiness, not to shrink the evidence
+                # further (per IMPLEMENT A SMALLER PER-OUTCOME VISUAL
+                # EVALUATION PATH, item 6: "reduce only that outcome's
+                # evidence" -- reduce once, not repeatedly).
+                retry_used = True
+                attempt_frames = attempt_frames[: max(1, len(attempt_frames) // VISUAL_OUTCOME_RETRY_FRAME_DIVISOR)]
+
+        elapsed = time.monotonic() - started
+        obtained = validated is not None
+        judgment = self._convert_visual_judgment(outcome, validated) if validated is not None else None
+        if manifest is not None:
+            try:
+                manifest.record_visual_outcome_evaluation(
+                    outcome_id=outcome.id,
+                    selected_frames=kept_frames,
+                    discovered_frame_count=discovered_count,
+                    obtained=obtained,
+                    retry_used=retry_used,
+                    criterion_states={c.criterion: c.state.value for c in validated.criteria} if validated else {},
+                    elapsed_seconds=round(elapsed, 2),
+                )
+            except Exception as exc:  # noqa: BLE001 -- manifest errors must never fail evaluation
+                logger.warning("Visual outcome manifest write failed: %s", exc)
+        return judgment, obtained, uncovered
+
+    async def _evaluate_visual_outcomes(
+        self,
+        exercise: Exercise,
+        outcomes_needing_llm: List[ExpectedOutcome],
+        events: List[EvidenceEvent],
+        session_id: Optional[str],
+        model: str,
+        timeout: float,
+        manifest: Optional[ManifestWriter],
+    ) -> "tuple[LLMEvaluationInsights, Dict[str, bool], Dict[str, List[str]]]":
+        """Orchestrates the per-outcome visual evaluation path: one dedicated
+        scoring call per outcome (see _score_visual_outcome), assembled
+        deterministically into the SAME LLMEvaluationInsights shape the
+        existing scoring pipeline (_score_outcome/_score_from_judgment)
+        already consumes -- no narrative generation happens here; see
+        evaluate()'s deterministic summary construction for visual runs.
+
+        Returns (insights, obtained_by_outcome, uncovered_by_outcome).
+        `obtained_by_outcome` lets the caller detect "every visual outcome's
+        call failed" (must present as unavailable/incomplete, never 0/100)
+        while still preserving any outcome whose call DID succeed.
+        """
+        outcome_judgments: List[OutcomeJudgment] = []
+        obtained_by_outcome: Dict[str, bool] = {}
+        uncovered_by_outcome: Dict[str, List[str]] = {}
+        for outcome in outcomes_needing_llm:
+            judgment, obtained, uncovered = await self._score_visual_outcome(
+                outcome, events, session_id, model, timeout, manifest,
+            )
+            obtained_by_outcome[outcome.id] = obtained
+            if judgment is None:
+                # No valid judgment could be obtained at all for this
+                # outcome (even after retrying) -- carry `uncovered` through
+                # so _score_from_judgment's judgment-is-None branch can
+                # still distinguish a pure selection gap from a genuine
+                # evaluator-call failure (see that branch's all_uncovered
+                # check).
+                uncovered_by_outcome.update(uncovered)
+                continue
+            # A judgment WAS obtained: the model was actually shown evidence
+            # (its own lexical hits, plus any deterministic discovery
+            # fallback -- see _score_visual_outcome) and returned a genuine
+            # per-criterion verdict for EVERY criterion, including
+            # "unverifiable" ones (handled by CriterionJudgment.unverifiable,
+            # not by uncovered_criteria). Do NOT also mark this outcome's
+            # criteria uncovered here -- that flag means "no evidence was
+            # ever selected to check", which is no longer true once a real
+            # judgment came back; passing it through would let a genuinely
+            # checked "contradicted" verdict be masked as merely pending.
+            outcome_judgments.append(judgment)
+        insights = LLMEvaluationInsights(summary="", outcome_judgments=outcome_judgments)
+        return insights, obtained_by_outcome, uncovered_by_outcome
+
+    async def _get_visual_llm_insights(
+        self,
+        exercise: Exercise,
+        events: List[EvidenceEvent],
+        verification: Dict[str, VerificationDetail],
+        session_id: Optional[str],
+        manifest: Optional[ManifestWriter] = None,
+        baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
+    ) -> "tuple[LLMEvaluationInsights, Optional[str], Dict[str, List[str]], Dict[str, str]]":
+        """Entry point for the per-outcome visual evaluation path -- same
+        return shape as _get_llm_insights (insights, ai_unavailable_reason,
+        uncovered_criteria, followup_answers) so evaluate()'s downstream
+        scoring loop is unchanged regardless of which path ran.
+        followup_answers is always {} here: the targeted-followup mechanism
+        existed to compensate for the OLD combined call's inability to
+        re-check a single exact-value criterion cheaply -- the per-outcome
+        path's own dedicated call (with the exact-text-grounding fix in
+        _evaluate_criteria) already does this directly, so no second call
+        is needed.
+
+        ai_unavailable_reason is set ONLY when EVERY outcome requiring an
+        LLM judgment failed to produce one at all (even after each one's
+        own retry) -- "all required visual outcomes are unverifiable
+        because model responses cannot be obtained or parsed" must present
+        as evaluator-unavailable, never as a legitimate 0/100, while an
+        outcome whose call DID succeed must still be scored and shown.
+        """
+        settings = get_settings()
+        model = settings.ollama_vision_model
+        timeout = settings.evaluation_timeout_seconds
+
+        outcomes_needing_llm = [
+            o for o in exercise.get_all_outcomes()
+            if o.id not in verification or needs_llm_attribution(o.id, verification, baseline_verification)
+        ]
+        if not outcomes_needing_llm:
+            return LLMEvaluationInsights(summary=""), None, {}, {}
+
+        insights, obtained_by_outcome, uncovered_by_outcome = await self._evaluate_visual_outcomes(
+            exercise, outcomes_needing_llm, events, session_id, model, timeout, manifest,
+        )
+
+        all_failed = bool(outcomes_needing_llm) and all(
+            not obtained_by_outcome.get(o.id, False) for o in outcomes_needing_llm
+        )
+        ai_unavailable_reason = (
+            "The AI evaluator could not obtain a valid structured judgment for any outcome "
+            "this run, even after retrying each one individually with reduced evidence."
+            if all_failed else None
+        )
+
+        # Same targeted, NEUTRAL follow-up mechanism the combined-call path
+        # uses (see _run_targeted_followup) -- reused unchanged here rather
+        # than trusting a per-outcome judgment's own `quote` as its own
+        # corroboration (see _evaluate_criteria's not-ocr-sufficient branch):
+        # this asks a DIFFERENT, backtick-redacted question, so an answer
+        # can only come from independently reading the screenshots, never
+        # from parroting the value the main scoring call was given.
+        pending: List["tuple[str, str]"] = []
+        if not all_failed:
+            ocr_sufficient = ocr_text_available(events)
+            for outcome in outcomes_needing_llm:
+                outcome_uncovered = set(uncovered_by_outcome.get(outcome.id, []))
+                for criterion in outcome.get_success_criteria():
+                    if not backtick_literals(criterion):
+                        continue
+                    if criterion in outcome_uncovered or not ocr_sufficient:
+                        pending.append((outcome.id, criterion))
+        followup_answers: Dict[str, str] = {}
+        if pending:
+            followup_answers = await self._run_targeted_followup(
+                pending, events, session_id, model, VISUAL_OUTCOME_NUM_CTX, timeout,
+            )
+        return insights, ai_unavailable_reason, uncovered_by_outcome, followup_answers
 
     async def _call_ollama(
         self, system_prompt: str, prompt: str, images: List[str], model: str,
@@ -1178,6 +1680,21 @@ class EvaluatorService:
         candidates += [(e, False, None) for e in judgment.criteria_not_met]
         return EvaluatorService._best_overlap_claim(criterion, distinctive_words or set(), candidates)
 
+    @staticmethod
+    def _criterion_marked_unverifiable(criterion: str, judgment: OutcomeJudgment) -> bool:
+        """True when a structured criterion_judgments entry matching this
+        criterion (same near-exact-text matching as _criterion_claimed_
+        support's tier 1) explicitly set unverifiable=True -- see
+        CriterionJudgment.unverifiable and _convert_visual_judgment. Legacy
+        responses (criteria_met/criteria_not_met only) never set this field,
+        so this is always False for the combined-call path, unchanged."""
+        norm_c = normalize_literal(criterion)
+        for cj in judgment.criterion_judgments:
+            norm_cj = normalize_literal(cj.criterion)
+            if norm_cj == norm_c or norm_c in norm_cj or norm_cj in norm_c:
+                return cj.unverifiable
+        return False
+
     # Minimum shared significant words to associate a paraphrased statement
     # with a criterion when NONE of the shared words are distinctive to that
     # specific criterion (see below) -- requiring 2+ generic shared words
@@ -1274,8 +1791,16 @@ class EvaluatorService:
             claimed_supported, quote = self._criterion_claimed_support(criterion, judgment, distinctive_words)
             literals = backtick_literals(criterion)
             is_uncovered = criterion in uncovered_criteria
+            # An explicit "unverifiable" from a per-outcome visual judgment
+            # (see CriterionJudgment.unverifiable / _convert_visual_judgment)
+            # takes priority over everything below: the model EXAMINED
+            # evidence for this specific criterion and could not confirm it
+            # either way -- an inconclusive read, never a confident fail.
+            marked_unverifiable = self._criterion_marked_unverifiable(criterion, judgment)
 
-            if not literals:
+            if marked_unverifiable:
+                state = CriterionEvidenceState.unavailable
+            elif not literals:
                 if claimed_supported is True:
                     state = CriterionEvidenceState.supported
                 elif is_uncovered:
@@ -1308,7 +1833,14 @@ class EvaluatorService:
                     # No selected evidence, or this session's OCR/AX text is
                     # too sparse to trust an absence reading either way --
                     # the follow-up either wasn't attempted or didn't
-                    # resolve this specific criterion.
+                    # resolve this specific criterion. Deliberately NOT
+                    # trusting this same judgment's own `quote` as a corpus
+                    # substitute here: a quote that merely echoes the
+                    # criterion's own expected literal is indistinguishable
+                    # from genuine parroting without an independent source
+                    # to check it against -- see _run_targeted_followup,
+                    # which asks a DIFFERENT, backtick-redacted question
+                    # specifically so the answer cannot be an echo.
                     state = CriterionEvidenceState.unavailable
                 elif claimed_supported:
                     missing = [lit for lit in literals if normalize_literal(lit) not in corpus]
@@ -1419,28 +1951,27 @@ class EvaluatorService:
         if judgment is not None:
             judgment.criteria_implicit = not outcome.has_explicit_criteria
 
-        if judgment is not None and judgment.observed:
+        if judgment is not None and not outcome.has_explicit_criteria and judgment.observed:
             # Screenshots are the primary source of truth for visual exercises
             # (see _select_model): when the vision model directly observes an
-            # action on screen, that is direct evidence -- not inference. But
-            # for an ENRICHED outcome (explicit success_criteria authored),
-            # observed=true by itself is not sufficient for FULL credit --
-            # see _criteria_fully_satisfied. Legacy outcomes (no explicit
-            # criteria -- nothing more granular was ever authored to check)
-            # keep the original behavior unchanged: observed=true earns full
-            # credit outright.
-            if not outcome.has_explicit_criteria:
-                return OutcomeResult(
-                    id=outcome.id,
-                    passed=True,
-                    score=outcome.weight,
-                    max_score=outcome.weight,
-                    confidence=Confidence.strongly_observed,
-                    evidence=judgment.evidence or "Observed in captured screenshots/activity.",
-                    verification_state=judgment.verification_state,
-                    feedback=judgment.feedback,
-                )
-            # Enriched outcome: the SCORING layer, not the model, derives the
+            # action on screen, that is direct evidence -- not inference.
+            # Legacy outcomes (no explicit criteria -- nothing more granular
+            # was ever authored to check) have no per-criterion detail to
+            # fall back on, so observed=true/false is the only signal and
+            # earns full credit outright.
+            return OutcomeResult(
+                id=outcome.id,
+                passed=True,
+                score=outcome.weight,
+                max_score=outcome.weight,
+                confidence=Confidence.strongly_observed,
+                evidence=judgment.evidence or "Observed in captured screenshots/activity.",
+                verification_state=judgment.verification_state,
+                feedback=judgment.feedback,
+            )
+        if judgment is not None and outcome.has_explicit_criteria:
+            # For an ENRICHED outcome (explicit success_criteria authored),
+            # the SCORING layer, not the model, derives the
             # final state from mechanically-validated per-criterion results
             # (see _evaluate_criteria) -- a self-reported observed=true or
             # verification_state="verified" is never sufficient on its own.

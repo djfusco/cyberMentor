@@ -199,6 +199,37 @@ class ManifestWriter:
         data["final_evaluation"] = snapshot
         self._save(data)
 
+    def record_visual_outcome_evaluation(
+        self,
+        outcome_id: str,
+        selected_frames: list,  # List[SelectedFrame]
+        discovered_frame_count: int,
+        obtained: bool,
+        retry_used: bool,
+        criterion_states: Dict[str, str],
+        elapsed_seconds: float,
+    ) -> None:
+        """One outcome's dedicated visual scoring call -- see
+        EvaluatorService._score_visual_outcome. Appended to a list (one
+        evaluation runs one of these per visual outcome, not one shared
+        record) so each outcome's own evidence packet, retry status, and
+        resulting criterion states are individually traceable -- required
+        for the per-outcome live-validation report (selected frames per
+        outcome, whether a retry happened, final criterion states).
+        """
+        data = self._load()
+        entries = data.setdefault("visual_outcomes", [])
+        entries.append({
+            "outcome_id": outcome_id,
+            "selected_frames": [_frame_record(sf, "visual_outcome") for sf in selected_frames],
+            "discovered_frame_count": discovered_frame_count,
+            "obtained": obtained,
+            "retry_used": retry_used,
+            "criterion_states": criterion_states,
+            "elapsed_seconds": elapsed_seconds,
+        })
+        self._save(data)
+
     # ------------------------------------------------------------------
     # Diagnostic prompt payload (opt-in via MENTOR_DIAGNOSTICS=true)
     # ------------------------------------------------------------------

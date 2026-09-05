@@ -289,8 +289,26 @@ class EvidenceNormalizer:
                         )
                     # No meaningful change (jitter / removed-only / unchanged):
                     # silently discard.  Baseline was already updated above.
+            elif event.type == "screen_change":
+                # Never text-similarity-deduped: this event's synthesized
+                # text ("Screen content changed (difference=0.09)") is a
+                # rounded MEASUREMENT, not real content -- two completely
+                # different on-screen states can coincidentally round to
+                # the identical synthesized text and would otherwise be
+                # wrongly collapsed as if they were the same screen
+                # (observed directly: a decisive results screen was
+                # silently dropped this way solely because its diff value
+                # happened to round the same as the preceding, unrelated
+                # screen's). The capture provider already made its own
+                # independent decision that the screen changed meaningfully
+                # enough to emit this event and capture a new frame for it;
+                # a second, superficial text-based dedup pass on top of
+                # that is redundant at best and evidence-destroying at
+                # worst, so every screen_change event is kept.
+                deduped.append(event)
             else:
-                # Non-text_observed: whole-text lookback deduplication.
+                # Non-text_observed, non-screen_change: whole-text lookback
+                # deduplication (unchanged).
                 match_index: Optional[int] = None
                 for idx in range(len(deduped) - 1, max(-1, len(deduped) - 1 - lookback), -1):
                     candidate = deduped[idx]

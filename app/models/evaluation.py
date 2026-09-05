@@ -124,6 +124,14 @@ class CriterionJudgment(BaseModel):
 
     criterion: str
     supported: bool
+    # Set true when the judge explicitly could not determine support either
+    # way (evidence was shown but was inconclusive) -- distinct from
+    # `supported=False`, which means the evidence affirmatively shows the
+    # criterion was NOT met. Takes priority over `supported` when true (see
+    # EvaluatorService._evaluate_criteria): an inconclusive read must never
+    # be scored as a confident fail. Default False so every existing caller
+    # (the legacy combined-call path, which never sets this) is unaffected.
+    unverifiable: bool = False
     evidence_basis: EvidenceBasis = EvidenceBasis.unclear
     # The exact quoted text/value the model claims appears in the evidence --
     # required (by the prompt) whenever the criterion names a specific exact
@@ -194,6 +202,45 @@ class LLMEvaluationInsights(BaseModel):
     verification_evidence: str = ""
 
 
+class VisualCriterionState(str, Enum):
+    """One success criterion's state as self-reported by a SINGLE-OUTCOME
+    visual scoring call (see EvaluatorService._score_visual_outcome) -- a
+    deliberately small, 3-way vocabulary for the model itself to choose
+    from. The scoring layer never trusts this alone for an exact-value
+    criterion (see CriterionJudgment.unverifiable / _evaluate_criteria);
+    it is converted into the richer, mechanically-derived
+    CriterionEvidenceState before it can affect a score.
+    """
+
+    supported = "supported"
+    contradicted = "contradicted"
+    unverifiable = "unverifiable"
+
+
+class VisualCriterionResult(BaseModel):
+    """One criterion's judgment from a per-outcome visual scoring call.
+    Deliberately minimal -- see the per-outcome schema requirements in
+    EvaluatorService._score_visual_outcome: only what scoring needs, no
+    outcome-level narrative, no unrelated outcomes."""
+
+    criterion: str
+    state: VisualCriterionState
+    quote: Optional[str] = None
+    frame_ref: Optional[str] = None
+
+
+class VisualOutcomeJudgment(BaseModel):
+    """The full response schema for ONE outcome's dedicated visual scoring
+    call -- supplied to Ollama's `format` request property as a JSON Schema
+    (via .model_json_schema()) so the response is grammar-constrained, not
+    merely requested in prompt text. See EvaluatorService._score_visual_outcome.
+    """
+
+    outcome_id: str
+    criteria: List[VisualCriterionResult] = PydanticField(default_factory=list)
+    feedback: str = ""
+
+
 class Evaluation(SQLModel, table=True):
     __tablename__ = "evaluations"
 
@@ -224,6 +271,14 @@ class Submission(SQLModel, table=True):
     score: float
     summary: str
     evaluation_json: str
+    # Mirrors the exported bundle's own top-level "evaluation_status" (see
+    # app.services.submission.build_submission_export) -- "unavailable" when
+    # the AI evaluator could not obtain valid judgments for this attempt, so
+    # the instructor-facing submissions table can show that instead of a
+    # numeric score that would otherwise read as a legitimate zero. Optional
+    # so existing rows (imported before this field existed) fall back to
+    # None, rendered the same as "complete" -- see loadSubmissionsTable().
+    evaluation_status: Optional[str] = None
     # None when the matching exercise (with its signing_key) isn't available
     # locally to verify against -- distinct from a confirmed bad signature.
     signature_valid: Optional[bool] = None

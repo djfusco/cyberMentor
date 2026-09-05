@@ -86,6 +86,8 @@ class OllamaService:
         model: Optional[str] = None,
         num_ctx: Optional[int] = None,
         timeout: Optional[float] = None,
+        format: Optional[dict] = None,
+        keep_alive: Optional[int] = None,
     ) -> str:
         """images: base64-encoded image strings (no data URL prefix), attached
         to the user message -- Ollama's /api/chat accepts this directly for
@@ -97,6 +99,31 @@ class OllamaService:
         request time rather than needing to trim the prompt. Pass `timeout`
         to override this instance's timeout for a single call (e.g. a slower
         session-query call) without creating a second OllamaService/client.
+
+        `format`: a JSON Schema object (e.g. Pydantic's own
+        `Model.model_json_schema()`) passed through to Ollama's real
+        structured-output `format` request property, which grammar-
+        constrains decoding so the response is guaranteed syntactically
+        valid JSON matching the schema -- this is enforced by Ollama/
+        llama.cpp itself, not merely requested in prompt text (verified
+        directly against this Ollama build/model combination: see
+        EvaluatorService._score_visual_outcome and the visual-evaluation
+        repair notes). None (the default) preserves the exact prior
+        behavior for every existing caller.
+
+        `keep_alive`: passed through to Ollama's own `keep_alive` request
+        property controlling how long the model stays loaded after this
+        response. Pass 0 to force Ollama to fully unload the model
+        immediately afterward -- reproducibly confirmed to clear a distinct
+        server-side bug on this build where switching between DIFFERENT
+        image sets on the SAME already-loaded multimodal model instance in
+        rapid succession corrupts its internal image cache and fails with
+        HTTP 500 "Chunk not found" (a fresh model load never exhibits it).
+        A full reload costs real time, so this is used only as a bounded,
+        last-resort recovery attempt (see EvaluatorService.
+        VISUAL_OUTCOME_MAX_ATTEMPTS), never on every call. None (the
+        default) omits the option entirely, preserving Ollama's own default
+        residency behavior for every other caller.
         """
         effective_timeout = timeout if timeout is not None else self.timeout
         options: dict = {"temperature": temperature}
@@ -129,6 +156,10 @@ class OllamaService:
             "stream": False,
             "options": options,
         }
+        if format is not None:
+            payload["format"] = format
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
         try:
             async with httpx.AsyncClient(timeout=effective_timeout) as client:
                 resp = await client.post(f"{self.base_url}/api/chat", json=payload)
@@ -279,3 +310,36 @@ class OllamaService:
             model=model, num_ctx=num_ctx, timeout=timeout,
         )
         return self._parse_json_dict(raw_retry)
+
+    async def chat_structured(
+        self, system_prompt: str, user_prompt: str, schema: dict, temperature: float = 0.0,
+        images: Optional[List[str]] = None, model: Optional[str] = None,
+        num_ctx: Optional[int] = None, timeout: Optional[float] = None,
+        keep_alive: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Chat with Ollama's `format` request property set to `schema` (a
+        JSON Schema object, e.g. from a Pydantic model's
+        `.model_json_schema()`) so the response is grammar-constrained
+        rather than merely requested in prompt wording -- see `chat()`'s
+        `format` parameter. Deliberately does NOT run the markdown-fence/
+        repair-prompt dance chat_json() does: a schema-constrained response
+        is syntactically valid JSON by construction, so a parse failure here
+        means the request itself failed (e.g. transport error) rather than
+        the model choosing not to comply, and the caller (per-outcome/
+        per-batch retry policy -- see EvaluatorService) decides whether and
+        how to retry, typically with a SMALLER evidence packet rather than
+        the same request again. Returns None on any parse failure; never
+        raises OllamaError for a parse issue (only chat() itself can raise,
+        for a genuine transport/HTTP failure).
+        """
+        raw = await self.chat(
+            system_prompt, user_prompt, temperature=temperature, images=images,
+            model=model, num_ctx=num_ctx, timeout=timeout, format=schema,
+            keep_alive=keep_alive,
+        )
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = self._parse_json_dict(raw)
+            return data
+        return data if isinstance(data, dict) else None

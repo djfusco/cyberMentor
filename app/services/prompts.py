@@ -1026,6 +1026,95 @@ Include exactly one answer per numbered question, in order.
 
 
 # ---------------------------------------------------------------------------
+# Per-outcome visual scoring -- ONE outcome, its own criteria, its own
+# selected evidence, a small response schema (see
+# app.models.evaluation.VisualOutcomeJudgment), no unrelated outcomes, no
+# narrative report. Replaces the combined multi-outcome vision call for
+# visual (GUI/SIEM/web) exercises -- see EvaluatorService._score_visual_outcome.
+# The combined-call path (EVALUATION_SYSTEM_PROMPT above) is unchanged and
+# still used for text-only (terminal-adjacent) evaluation.
+# ---------------------------------------------------------------------------
+
+VISUAL_OUTCOME_SYSTEM_PROMPT = """You are scoring ONE specific outcome of a technical exercise from screenshots
+of the learner's screen. You are given only this outcome's own success
+criteria and its own selected evidence -- judge only what is shown.
+
+For EACH listed criterion, decide:
+- "supported": the screenshots directly show this criterion was met.
+- "contradicted": the screenshots directly show this criterion was NOT met
+  (e.g. an empty/error result where a real one was required, or a visibly
+  different value than what the criterion names).
+- "unverifiable": you cannot tell either way from what is shown.
+
+Rules:
+- Use ONLY what is visibly present in the attached screenshots. Do not infer
+  field names, values, counts, or outcomes that are not directly shown.
+- A screenshot of a CHAT PANEL, ASSISTANT/MENTOR conversation, or any text
+  that is guidance/suggestion/instruction (rather than the target
+  application's own UI) is NOT evidence of what the learner did. If an
+  attached screenshot shows a chat or assistant panel instead of the target
+  application, note that and treat it as providing no evidence for the
+  criteria below -- never treat a suggested command/value written by an
+  assistant as something the learner actually did or saw in the application.
+- A command or query being visible only proves it was entered/run, not that
+  its result was correct. Judge the RESULT shown (or its absence) as its own
+  piece of evidence, independent of whether the query text looks correct. An
+  empty or null result must never be read as success.
+- For a criterion naming an exact literal value (a field name, command,
+  value, count, or identifier -- typically backtick-quoted, e.g. "the field
+  `src_ip` appears"), set "quote" to the EXACT text/value you actually read
+  on screen, character for character -- even if it differs from what the
+  criterion names. Do not copy the criterion's own expected value into
+  "quote" as if that proves it; state what you actually saw. Leave "quote"
+  null for criteria with no exact-value claim.
+- Set "frame_ref" to which attached screenshot (its number, as captioned)
+  you relied on, or null if none applied.
+- Do not guess. When genuinely unsure, use "unverifiable" rather than
+  picking "supported" or "contradicted".
+
+Respond with ONLY a single JSON object, no prose before or after, no
+markdown code fences, matching the required schema exactly. Include exactly
+one entry in "criteria" for each criterion listed below, in the same order,
+with the criterion text copied verbatim.
+"""
+
+
+def build_visual_outcome_scoring_prompt(
+    outcome_id: str, criteria: List[str], frame_captions: str, outcome_description: str = "",
+) -> str:
+    criteria_lines = "\n".join(f"  {i}. {c}" for i, c in enumerate(criteria, 1))
+    desc_line = f"What this outcome is about: {outcome_description}\n" if outcome_description else ""
+    return f"""Outcome ID: {outcome_id}
+{desc_line}
+Success criteria to judge (respond with exactly one "criteria" entry per
+line below, in order, copying the criterion text verbatim):
+{criteria_lines}
+
+{frame_captions}
+
+Judge ONLY the criteria above, using ONLY the attached screenshots. Return
+the JSON object described in the system prompt.
+"""
+
+
+# ---------------------------------------------------------------------------
+# NOTE on visual evidence discovery: an LLM-based discovery pass (a numbered
+# contact-sheet image asking "which frame numbers are relevant", and
+# per-frame open-ended captioning) was implemented and measured directly
+# against the installed llava:latest build before being adopted here, and
+# was found unreliable for this specific task: open-ended captioning
+# fabricated specific incorrect on-screen details (table columns, URLs) that
+# were not present, and relevance-selection queries returned either "every
+# frame" or "no frame" almost regardless of actual content. The SAME model
+# reliably answers a narrow, fully-specified supported/contradicted/
+# unverifiable question when given full criteria context (see
+# VISUAL_OUTCOME_SYSTEM_PROMPT above). Evidence discovery for text-sparse
+# frames is therefore a deterministic candidate-ranking step (see
+# EvaluatorService._discover_candidate_frames), not a second model call --
+# selection and scoring remain separate steps, just not both LLM-based.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Exercise authoring, review, and class-analysis prompts have moved to
 # app/services/instructor_prompts.py -- they are not needed by the
 # student-facing Practice flow (mentor chat, session Q&A, evaluation) that
