@@ -627,6 +627,27 @@ STRICT EVIDENCE RULES for every outcome judgment (these prevent false credit):
   observed click, but the target must remain unknown unless a screenshot or
   accessibility evidence (window title, AX label, OCR text) identifies it.
   Do not infer the target from coordinates.
+- EXACT-VALUE CRITERIA: when a criterion or evidence requirement names an
+  exact value -- a field name, index name, file name, or other literal
+  string (often shown in backticks, e.g. "the field `src_ip` appears") --
+  do not mark that criterion met unless that EXACT value is visible in a
+  screenshot or present in the timeline text. A similarly-named, related, or
+  conceptually-equivalent value does NOT satisfy an exact-value criterion.
+  If what you actually observe differs from the value the criterion names
+  (e.g. the criterion names `dst_ip` but the screen shows a field called
+  `dest_ip`), report the ACTUAL value you saw in your evidence text and mark
+  that specific criterion not met -- never state that the criterion's named
+  value was visible when a different value is what actually appeared. Do
+  not paraphrase or "round" an observed value to match what the criterion
+  expected.
+- A COMMAND OR QUERY BEING VISIBLE PROVES ONLY THAT IT WAS RUN, NOT THAT IT
+  SUCCEEDED. Seeing a query/command entered and executed is evidence the
+  learner attempted that step -- it is separate evidence from, and does not
+  imply, that its result was correct or complete. Always evaluate the
+  RESULT (the output, the returned values, an empty/error result) as its
+  own piece of evidence, independent of whether the query/command text
+  itself looks correct. An empty or null result must not be described as
+  success merely because the query syntax was well-formed.
 
 You are NOT responsible for deciding WHETHER the final state of an objective,
 deterministically verified outcome (e.g. filesystem state) is correct -- that

@@ -79,6 +79,14 @@ class EvaluationResult(BaseModel):
     # "no activity observed" is never confused with "evidence retrieval
     # failed".
     evidence_error: Optional[str] = None
+    # Set when the AI evaluation call itself could not be completed (e.g. a
+    # model timeout), even after one retry with a smaller evidence packet --
+    # distinct from evidence_error (evidence RETRIEVAL failing upstream).
+    # Every LLM-judged outcome scores 0 in this case, but that 0 must never
+    # be read as "the learner didn't do it" -- see
+    # EvaluatorService._score_from_judgment, which threads this into each
+    # affected outcome's own evidence text and verification_state.
+    ai_unavailable: Optional[str] = None
 
 
 class OutcomeJudgment(BaseModel):

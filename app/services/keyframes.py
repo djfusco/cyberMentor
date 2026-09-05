@@ -22,10 +22,11 @@ data. It selects from already-captured frame paths only.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from app.services.evidence import EvidenceEvent
+from app.services.text_relevance import outcome_keyword_text, overlap_score, significant_words
 
 # ---------------------------------------------------------------------------
 # Named configuration constants
@@ -70,6 +71,14 @@ class SelectedFrame:
     # None for spread frames (no anchor) and for frames selected before this
     # field was introduced. Populated for before/after anchor frames only.
     anchor_timestamp: object = None  # datetime or None
+    # Populated only by the outcome-aware path (select_keyframes(..., outcomes=...)).
+    # Zero/empty for the original generic path (mentor chat, session Q&A),
+    # which never sets these -- purely additive, safe defaults.
+    relevance_score: float = 0.0
+    # Human-readable reason this frame was selected -- which outcome(s) its
+    # nearby evidence text matched, or "generic coverage" -- surfaced in
+    # diagnostics (capture_manifest) so a human can see WHY a frame was kept.
+    matched_evidence: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +120,7 @@ def _evenly_sample(items: list, budget: int) -> list:
 
 
 def select_keyframes(
-    events: List[EvidenceEvent], max_frames: int
+    events: List[EvidenceEvent], max_frames: int, outcomes: Optional[Sequence] = None
 ) -> List[SelectedFrame]:
     """Return up to *max_frames* SelectedFrames using anchor-first selection.
 
@@ -128,6 +137,16 @@ def select_keyframes(
     4. Fill the remaining budget with spread frames: distinct paths not already
        claimed by anchors, sampled evenly across the remaining session span.
     5. Combine, deduplicate by path, sort chronologically, cap at max_frames.
+
+    `outcomes`: when given (a sequence of ExpectedOutcome-like objects with
+    `.description` / `.success_criteria` / `.evidence_requirements` /
+    `.student_demonstration`), selection switches to a RELEVANCE-RANKED mode
+    instead of step 3/4's blind even-temporal sampling -- see
+    `_select_relevant_frames`. This is what EvaluatorService uses so decisive
+    result evidence (a completed query result, a final confirmation screen)
+    is never discarded just because it falls in a temporally dense cluster.
+    Every other caller (mentor chat, session Q&A) omits `outcomes` and gets
+    byte-for-byte the original generic behavior.
     """
     if max_frames <= 0:
         return []
@@ -191,37 +210,43 @@ def select_keyframes(
                 )
             )
 
-    # --- Step 3: distribute anchor frames across session if over budget ---
-    if len(anchor_frames) > anchor_budget:
-        anchor_frames = _evenly_sample(anchor_frames, anchor_budget)
+    if outcomes:
+        all_frames = _select_relevant_frames(
+            anchor_frames, frame_events, outcomes, max_frames,
+        )
+    else:
+        # --- Step 3: distribute anchor frames across session if over budget ---
+        if len(anchor_frames) > anchor_budget:
+            anchor_frames = _evenly_sample(anchor_frames, anchor_budget)
 
-    # --- Step 4: spread frames from uncovered periods ---
-    anchor_paths_final: Set[str] = {sf.path for sf in anchor_frames}
-    remaining_budget = max_frames - len(anchor_frames)
+        # --- Step 4: spread frames from uncovered periods ---
+        anchor_paths_final: Set[str] = {sf.path for sf in anchor_frames}
+        remaining_budget = max_frames - len(anchor_frames)
 
-    spread_frames: List[SelectedFrame] = []
-    if remaining_budget > 0:
-        spread_seen: Set[str] = set()
-        spread_candidates: List[Tuple[int, str, EvidenceEvent]] = []
-        for idx, path, ev in frame_events:
-            if path not in anchor_paths_final and path not in spread_seen:
-                spread_seen.add(path)
-                spread_candidates.append((idx, path, ev))
+        spread_frames: List[SelectedFrame] = []
+        if remaining_budget > 0:
+            spread_seen: Set[str] = set()
+            spread_candidates: List[Tuple[int, str, EvidenceEvent]] = []
+            for idx, path, ev in frame_events:
+                if path not in anchor_paths_final and path not in spread_seen:
+                    spread_seen.add(path)
+                    spread_candidates.append((idx, path, ev))
 
-        for _, path, ev in _evenly_sample(spread_candidates, remaining_budget):
-            spread_frames.append(
-                SelectedFrame(
-                    path=path,
-                    timestamp=ev.timestamp,
-                    application=ev.application,
-                    window_title=ev.window_title,
-                    trigger_type="spread",
-                    role="spread",
+            for _, path, ev in _evenly_sample(spread_candidates, remaining_budget):
+                spread_frames.append(
+                    SelectedFrame(
+                        path=path,
+                        timestamp=ev.timestamp,
+                        application=ev.application,
+                        window_title=ev.window_title,
+                        trigger_type="spread",
+                        role="spread",
+                    )
                 )
-            )
+
+        all_frames = anchor_frames + spread_frames
 
     # --- Step 5: combine, deduplicate, sort chronologically ---
-    all_frames = anchor_frames + spread_frames
     final: List[SelectedFrame] = []
     seen_final: Set[str] = set()
     for sf in all_frames:
@@ -231,6 +256,177 @@ def select_keyframes(
 
     final.sort(key=lambda sf: path_order.get(sf.path, 0))
     return final[:max_frames]
+
+
+# ---------------------------------------------------------------------------
+# Outcome-aware relevance selection
+# ---------------------------------------------------------------------------
+
+
+def _event_text_signal(ev: EvidenceEvent) -> str:
+    """Every word of text plausibly associated with one captured frame:
+    the window title (the dominant generic signal for GUI/web/SIEM
+    exercises -- browser/app window titles reliably carry topic words, e.g.
+    "Search | Splunk", "Add Data - Success"), the event's own synthesized
+    text, and any newly-added/changed OCR/AX text on that same event.
+    """
+    parts = [ev.window_title or "", ev.text or ""]
+    if ev.text_delta:
+        parts.extend(line for tag, line in ev.text_delta if tag in ("added", "meaningful_modified"))
+    return " ".join(parts)
+
+
+def _select_relevant_frames(
+    anchor_frames: List[SelectedFrame],
+    frame_events: List[Tuple[int, str, EvidenceEvent]],
+    outcomes: Sequence,
+    max_frames: int,
+) -> List[SelectedFrame]:
+    """Rank every frame-bearing event by relevance to the exercise's own
+    outcomes (description + success_criteria + evidence_requirements +
+    student_demonstration -- whatever the author actually wrote, nothing
+    invented), and fill the frame budget by relevance first, falling back to
+    even temporal coverage only for whatever budget relevance can't fill.
+
+    This is what keeps a temporally-clustered but decisive result frame (a
+    query's own result screen, a final confirmation) from being discarded by
+    blind even-sampling just because several other frames sit near it in
+    time -- see the "even temporal sampling cannot discard more relevant
+    evidence" regression requirement.
+    """
+    outcome_keywords = [
+        (getattr(o, "id", str(i)), significant_words(outcome_keyword_text(o)))
+        for i, o in enumerate(outcomes)
+    ]
+    outcome_keywords = [(oid, kw) for oid, kw in outcome_keywords if kw]
+
+    # One candidate per distinct frame path, scored against every outcome's
+    # keyword set. anchor_frames' metadata (role/trigger_type from the
+    # before/after pairing) is preserved when available, since "after a
+    # meaningful screen/query change" is itself a relevance signal (role
+    # "after" outranks "before" on a tie -- see the sort key below);
+    # anchor coverage is a superset check, not a replacement, so every
+    # frame_event is still considered even if it wasn't anchor-paired.
+    by_path_anchor: Dict[str, SelectedFrame] = {}
+    for sf in anchor_frames:
+        # Keep the first (highest-priority: earliest-discovered) anchor
+        # metadata per path, matching the existing dedup rule.
+        by_path_anchor.setdefault(sf.path, sf)
+
+    seen_paths: Set[str] = set()
+    candidates: List[Tuple[float, str, SelectedFrame]] = []
+    for idx, path, ev in frame_events:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+
+        text_words = significant_words(_event_text_signal(ev))
+        best_score = 0.0
+        best_outcome_id: Optional[str] = None
+        for oid, kw in outcome_keywords:
+            score = float(overlap_score(text_words, kw))
+            if score > best_score:
+                best_score = score
+                best_outcome_id = oid
+
+        anchor = by_path_anchor.get(path)
+        role = anchor.role if anchor is not None else "spread"
+        trigger_type = anchor.trigger_type if anchor is not None else "spread"
+        anchor_timestamp = anchor.anchor_timestamp if anchor is not None else None
+
+        matched_evidence = (
+            f"relevant to outcome '{best_outcome_id}' (matched: "
+            f"{', '.join(sorted(text_words & dict(outcome_keywords)[best_outcome_id]))})"
+            if best_outcome_id is not None
+            else "generic timeline coverage (no outcome-keyword match)"
+        )
+
+        candidates.append((
+            best_score,
+            best_outcome_id or "",
+            SelectedFrame(
+                path=path,
+                timestamp=ev.timestamp,
+                application=ev.application,
+                window_title=ev.window_title,
+                trigger_type=trigger_type,
+                role=role,
+                anchor_timestamp=anchor_timestamp,
+                relevance_score=best_score,
+                matched_evidence=matched_evidence,
+            ),
+        ))
+
+    if not candidates:
+        return []
+
+    # Round-robin: give each outcome a fair shot at its own best-scoring,
+    # not-yet-claimed frame(s) before spending budget on a second frame for
+    # any single outcome -- this is what makes "~2 relevant frames per
+    # outcome" the natural spread rather than one outcome's evidence
+    # crowding out another's.
+    frames_per_outcome = max(1, -(-max_frames // max(1, len(outcome_keywords)))) if outcome_keywords else 0
+    claimed: Set[str] = set()
+    selected: List[SelectedFrame] = []
+
+    def _sort_key(item):
+        score, _, sf = item
+        # Higher relevance first; among ties, prefer a post-change/result
+        # frame ("after") over a pre-change one, then the LATER frame (a
+        # late-session result state over an earlier, possibly-superseded one).
+        role_rank = {"after": 0, "spread": 1, "before": 2}.get(sf.role, 1)
+        ts = sf.timestamp
+        recency = -(ts.timestamp()) if hasattr(ts, "timestamp") else 0
+        return (-score, role_rank, recency)
+
+    for oid, _ in outcome_keywords:
+        if len(selected) >= max_frames:
+            break
+        own = sorted(
+            (c for c in candidates if c[1] == oid and c[2].path not in claimed and c[0] > 0),
+            key=_sort_key,
+        )
+        for _, _, sf in own[:frames_per_outcome]:
+            if len(selected) >= max_frames:
+                break
+            claimed.add(sf.path)
+            selected.append(sf)
+
+    # A second pass lets any outcome with still-unused, still-relevant
+    # frames take more of the remaining budget before falling back to
+    # generic coverage, rather than immediately handing leftover slots to
+    # zero-relevance filler.
+    if len(selected) < max_frames:
+        leftover_relevant = sorted(
+            (c for c in candidates if c[0] > 0 and c[2].path not in claimed),
+            key=_sort_key,
+        )
+        for _, _, sf in leftover_relevant:
+            if len(selected) >= max_frames:
+                break
+            claimed.add(sf.path)
+            selected.append(sf)
+
+    # Fill any remaining budget with generic even-temporal coverage from
+    # whatever is left, so an outcome with no textual signal at all (e.g. a
+    # purely visual confirmation with no matching window-title words) still
+    # gets some representation instead of zero frames.
+    if len(selected) < max_frames:
+        remaining = [c for c in candidates if c[2].path not in claimed]
+        remaining.sort(key=lambda c: path_order_lookup(c[2].path, frame_events))
+        fill = _evenly_sample(remaining, max_frames - len(selected))
+        for _, _, sf in fill:
+            claimed.add(sf.path)
+            selected.append(sf)
+
+    return selected
+
+
+def path_order_lookup(path: str, frame_events: List[Tuple[int, str, EvidenceEvent]]) -> int:
+    for idx, p, _ in frame_events:
+        if p == path:
+            return idx
+    return 0
 
 
 def format_frame_captions(frames: List[SelectedFrame]) -> str:
@@ -259,5 +455,8 @@ def format_frame_captions(frames: List[SelectedFrame]) -> str:
             ts = str(sf.timestamp)
         window = f" ({sf.window_title[:60]})" if sf.window_title else ""
         role_label = role_labels.get(sf.role, sf.role).format(trigger=sf.trigger_type)
-        lines.append(f"  {i}. [{ts}] {sf.application}{window} — {role_label}")
+        line = f"  {i}. [{ts}] {sf.application}{window} — {role_label}"
+        if sf.matched_evidence:
+            line += f" ({sf.matched_evidence})"
+        lines.append(line)
     return "\n".join(lines)

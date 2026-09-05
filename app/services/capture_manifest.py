@@ -54,6 +54,13 @@ def _frame_record(sf, consumer: str) -> Dict[str, Any]:
         "anchor_timestamp": _iso(anchor_ts) if isinstance(anchor_ts, datetime) else None,
         "role": sf.role,
         "consumer": consumer,
+        # Populated only when selection was outcome-relevance-aware (see
+        # app.services.keyframes.select_keyframes(..., outcomes=...)) --
+        # 0.0 / "" for the generic mentor-chat/session-query path, which
+        # never sets these. Answers "why was this frame kept" for diagnostics
+        # (requirement: record which frames were selected and why).
+        "relevance_score": getattr(sf, "relevance_score", 0.0),
+        "matched_evidence": getattr(sf, "matched_evidence", ""),
     }
 
 
@@ -165,6 +172,8 @@ class ManifestWriter:
         selected_frames: list,  # List[SelectedFrame]
         images_attached: bool,
         use_vision: bool,
+        retry_used: bool = False,
+        ai_unavailable: Optional[str] = None,
     ) -> None:
         snapshot = {
             "model_request_timestamp": model_request_timestamp,
@@ -177,6 +186,14 @@ class ManifestWriter:
             "selected_frames": [_frame_record(sf, "final_evaluation") for sf in selected_frames],
             "images_attached": images_attached,
             "use_vision": use_vision,
+            # Set when the first (larger) request failed and this snapshot
+            # reflects the smaller retry payload instead -- see
+            # EvaluatorService._get_llm_insights. ai_unavailable is the
+            # reason the retry ALSO failed (None on success), so a human
+            # reading the manifest can immediately tell "unscored due to an
+            # evaluator failure" apart from a normal successful evaluation.
+            "retry_used": retry_used,
+            "ai_unavailable": ai_unavailable,
         }
         data = self._load()
         data["final_evaluation"] = snapshot

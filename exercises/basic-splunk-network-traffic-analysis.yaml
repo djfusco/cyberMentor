@@ -1,0 +1,126 @@
+id: basic-splunk-network-traffic-analysis
+title: Basic Splunk Network Traffic Analysis
+description: Students load a network traffic CSV into Splunk, verify ingestion, and
+  use SPL to find the top source IP by total bytes.
+instructions: 1. Create an index named `network_traffic` and upload `network_traffic_flows.csv`
+  using the `csv` sourcetype. 2. Set time range to *All time* and search the index
+  to confirm fields `src_ip`, `dst_ip`, and `bytes` are present. 3. Run SPL to compute
+  total bytes per `src_ip`, sort descending, and identify the top source IP.
+environment:
+  type: gui
+difficulty: beginner
+expected_outcomes: []
+steps:
+- id: step_load_data
+  title: Load the data
+  instructions: Create or select an index named `network_traffic`. Upload `network_traffic_flows.csv`
+    using the `csv` sourcetype. Confirm the upload completes successfully.
+  expected_outcomes:
+  - id: upload_confirmed
+    description: Upload completes with visible confirmation in the Splunk web UI
+    type: observed_behavior
+    weight: 30.0
+    check: null
+    objective_ids:
+    - LO1
+    success_criteria:
+    - 'The UI displays a message indicating upload completion (e.g., ''Events ingested:
+      X'')'
+    - The index name is exactly `network_traffic` and sourcetype is `csv`
+    evidence_requirements:
+    - Visible upload summary in the Add Data wizard or Events tab showing event count
+    - No error messages during upload
+    scoring_rubric: null
+    feedback_if_missing: Re-run the Add Data wizard, ensure the index is named exactly
+      `network_traffic`, and select `csv` as the sourcetype.
+    student_demonstration: null
+- id: step_verify_data
+  title: Verify the data
+  instructions: Set the time range to *All time*. Search the `network_traffic` index.
+    Confirm that results are returned and that the fields `src_ip`, `dst_ip`, and
+    `bytes` are present.
+  expected_outcomes:
+  - id: search_returns_events
+    description: Search returns events with required fields visible
+    type: observed_behavior
+    weight: 30.0
+    check: null
+    objective_ids:
+    - LO2
+    success_criteria:
+    - At least one event is returned in the search results
+    - The fields `src_ip`, `dst_ip`, and `bytes` appear in the event details or field
+      list
+    evidence_requirements:
+    - Search results table or event details showing values for `src_ip`, `dst_ip`,
+      and `bytes`
+    - Time range set to All time (not a relative range)
+    scoring_rubric: null
+    feedback_if_missing: Ensure the time range is set to All time and re-run the search;
+      verify the index name is correct.
+    student_demonstration: null
+- id: step_identify_top_ip
+  title: Identify the top traffic source
+  instructions: 'Use SPL to total bytes by `src_ip`, sort descending, and identify
+    the top source IP. One valid SPL example is: `index=network_traffic | stats sum(bytes)
+    AS total_bytes BY src_ip | sort - total_bytes`.'
+  expected_outcomes:
+  - id: top_ip_identified
+    description: SPL query correctly aggregates, sorts, and displays the top source
+      IP
+    type: observed_behavior
+    weight: 40.0
+    check: null
+    objective_ids:
+    - LO3
+    success_criteria:
+    - The SPL query uses `stats sum(bytes) BY src_ip` (or equivalent aggregation)
+    - Results are sorted by total bytes in descending order
+    - The top `src_ip` appears in the first row of results
+    evidence_requirements:
+    - SPL query output showing `src_ip` and `total_bytes` columns
+    - First row contains the IP with the highest `total_bytes` value
+    - No syntax errors in the SPL query
+    scoring_rubric: null
+    feedback_if_missing: Re-run the SPL query with correct aggregation and sorting;
+      ensure `sort - total_bytes` is used to place the highest value first.
+    student_demonstration: null
+acceptable_methods:
+- Any SPL that computes total bytes per src_ip, sorts descending, and returns the
+  top IP
+- Use of equivalent SPL syntax (e.g., `| sort 1 -total_bytes`, `| head 1`)
+- Use of local Splunk web interface only
+prohibited_behaviors:
+- Using a remote or university-managed Splunk instance instead of local
+- Relying on pre-existing data from prior sessions
+- Adding extra tasks (e.g., dashboards, alerts) without explicit approval
+mentor:
+  allow_questions: true
+  default_help_level: 2
+  reveal_answer: false
+learning_objectives:
+- id: LO1
+  description: Ingest network traffic data into a dedicated Splunk index using the
+    CSV sourcetype
+  measurable_skills:
+  - Create a Splunk index
+  - Upload CSV data via web UI
+  - Verify sourcetype assignment
+- id: LO2
+  description: Verify data ingestion by searching the index and confirming required
+    fields are present
+  measurable_skills:
+  - Set time range to All time
+  - Run a basic search
+  - Confirm field presence
+- id: LO3
+  description: Use SPL to aggregate and sort network traffic by source IP to identify
+    the top consumer
+  measurable_skills:
+  - Write SPL aggregation commands
+  - Sort results by numeric field
+  - Interpret top result
+signing_key: 3b4a9b6d303457727b0d9d120c14aea0
+author: null
+created_at: '2026-09-04T18:59:19.719968Z'
+sources: []

@@ -13,7 +13,14 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from app.config import BASE_DIR, get_settings
-from app.models.evaluation import Confidence, EvaluationResult, EvidenceBasis, LLMEvaluationInsights, OutcomeResult
+from app.models.evaluation import (
+    Confidence,
+    EvaluationResult,
+    EvidenceBasis,
+    LLMEvaluationInsights,
+    OutcomeJudgment,
+    OutcomeResult,
+)
 from app.models.exercise import EnvironmentType, Exercise, ExpectedOutcome, OutcomeType, VerificationState
 from app.services.capture_manifest import ManifestWriter
 from app.services.evidence import EvidenceEvent, EvidenceService
@@ -60,6 +67,38 @@ EVALUATION_MIN_EVENTS = 10
 # those prompts are trimmed to fit -- an oversized prompt is fixed by
 # trimming evidence (see token_budget.py), not by raising this further.
 VISION_NUM_CTX = 65536
+
+# How many screenshots the evaluation payload budgets per expected outcome
+# when selecting RELEVANT evidence (see select_keyframes(..., outcomes=...)),
+# not per session. The actual frame budget for a given exercise is
+# min(EVALUATION_MAX_VISION_FRAMES, num_outcomes * EVALUATION_FRAMES_PER_OUTCOME)
+# -- e.g. a 3-outcome exercise budgets 6 frames, not the full 16-frame
+# ceiling, while a much larger exercise is still capped at the ceiling. This
+# is what replaced blindly spreading a large frame count evenly across the
+# whole session (which reliably diluted the request with irrelevant frames
+# and pushed prompt size, and therefore wall-clock time, past the model's
+# timeout -- see EVALUATION_TIMEOUT_RETRY_* below for what happens if it
+# still doesn't fit).
+EVALUATION_FRAMES_PER_OUTCOME = 2
+# Hard ceiling on total base64-encoded image bytes attached to one
+# evaluation request, regardless of how many outcomes an exercise has. When
+# the relevance-selected frame set exceeds this, the LEAST relevant frames
+# (by SelectedFrame.relevance_score) are dropped first -- never the most
+# relevant ones -- down to EVALUATION_MIN_IMAGES_FLOOR. ~333KB/image is a
+# generous allowance for a 1280px-wide JPEG at quality 85 (see
+# _downscale_image_bytes); six such images comfortably fits under 2MB.
+EVALUATION_MAX_IMAGE_BYTES = 3_000_000
+# Never trim relevance-selected frames below this floor when bounding bytes
+# -- an evaluation with literally zero screenshots defeats the point of a
+# visual exercise, so byte-bounding degrades resolution/count gracefully
+# rather than all the way to nothing.
+EVALUATION_MIN_IMAGES_FLOOR = 2
+# When the model call fails (timeout or otherwise), retry EXACTLY ONCE with
+# a strictly smaller payload -- half the frames (kept: the most RELEVANT
+# half, not an arbitrary temporal subset) and half the event window -- never
+# the same oversized request twice. See _get_llm_insights.
+EVALUATION_RETRY_FRAME_DIVISOR = 2
+EVALUATION_RETRY_EVENT_DIVISOR = 2
 
 # Used by session-query routing (app/services/session_query.py), NOT by
 # evaluation routing. Session Q&A is interactive and cost-sensitive, so it
@@ -162,6 +201,70 @@ def _downscale_image_bytes(raw: bytes, max_width: int = VISION_FRAME_MAX_WIDTH) 
     out = io.BytesIO()
     img.convert("RGB").save(out, format="JPEG", quality=85)
     return out.getvalue()
+
+
+def _encode_frames(
+    frames: List[SelectedFrame], session_id: Optional[str] = None
+) -> "tuple[List[str], List[SelectedFrame]]":
+    """Like _encode_images, but keeps the returned image list and the
+    SelectedFrame list it came from aligned 1:1 (unreadable frames are
+    dropped from BOTH, together) -- needed so byte-bounding and retry-time
+    frame trimming can reason about relevance_score per actual image sent,
+    not just per originally-selected path.
+    """
+    encoded: List[str] = []
+    kept: List[SelectedFrame] = []
+    for sf in frames:
+        resolved = _resolve_frame_path(sf.path, session_id)
+        try:
+            with open(resolved, "rb") as f:
+                raw = f.read()
+        except OSError as exc:
+            logger.warning("Could not read screenshot frame %s for vision evaluation: %s", resolved, exc)
+            continue
+        encoded.append(base64.b64encode(_downscale_image_bytes(raw)).decode("ascii"))
+        kept.append(sf)
+    return encoded, kept
+
+
+def _bound_images_by_bytes(
+    images: List[str],
+    frames: List[SelectedFrame],
+    max_bytes: int,
+    min_images: int = EVALUATION_MIN_IMAGES_FLOOR,
+) -> "tuple[List[str], List[SelectedFrame]]":
+    """Drop the LEAST relevant images (by SelectedFrame.relevance_score)
+    first when the total base64 payload exceeds max_bytes, never below
+    min_images (or below however many images/frames exist, if fewer).
+    Preserves the original chronological order of whatever remains.
+    """
+    total = sum(len(img) for img in images)
+    if total <= max_bytes or len(images) <= min_images:
+        return images, frames
+
+    paired = list(zip(images, frames))
+    # Sort ascending by relevance so the least relevant are dropped first;
+    # ties keep their original (chronological) relative order (stable sort).
+    by_relevance_asc = sorted(range(len(paired)), key=lambda i: paired[i][1].relevance_score)
+
+    keep_indices = set(range(len(paired)))
+    for idx in by_relevance_asc:
+        if len(keep_indices) <= min_images:
+            break
+        candidate_total = sum(len(paired[i][0]) for i in keep_indices if i != idx)
+        if candidate_total <= max_bytes:
+            keep_indices.discard(idx)
+            total = candidate_total
+            if total <= max_bytes:
+                break
+        else:
+            # Removing this one alone doesn't get under budget yet, but
+            # removing it is still progress toward the floor -- keep going.
+            keep_indices.discard(idx)
+            total = candidate_total
+
+    kept_pairs = [paired[i] for i in sorted(keep_indices)]
+    return [p[0] for p in kept_pairs], [p[1] for p in kept_pairs]
 
 
 def _encode_images(paths: List[str], session_id: Optional[str] = None) -> List[str]:
@@ -327,7 +430,7 @@ class EvaluatorService:
         # re-derive the same fact from noisy OCR text.
         evidence_facts = extract_evidence_facts(exercise, events, verification)
 
-        llm_insights = await self._get_llm_insights(
+        llm_insights, ai_unavailable_reason = await self._get_llm_insights(
             exercise, events, verification, evidence_error, session_id, manifest=manifest,
             baseline_verification=baseline_verification, evidence_facts=evidence_facts,
         )
@@ -339,6 +442,7 @@ class EvaluatorService:
                 result = self._score_outcome(
                     outcome, verification, events, llm_insights, evidence_error,
                     baseline_verification=baseline_verification, evidence_facts=evidence_facts,
+                    ai_unavailable_reason=ai_unavailable_reason,
                 )
                 if is_real_step:
                     result.step_id = step.id
@@ -360,6 +464,34 @@ class EvaluatorService:
             alternative_approaches=llm_insights.alternative_approaches,
             risky_or_unnecessary_steps=llm_insights.risky_or_unnecessary_steps,
             evidence_error=evidence_error,
+            ai_unavailable=ai_unavailable_reason,
+        )
+
+    def _select_evaluation_frames(
+        self, exercise: Exercise, events: List[EvidenceEvent], session_id: Optional[str], frame_budget: int,
+    ) -> "tuple[List[str], List[SelectedFrame]]":
+        """Outcome-relevance-ranked frame selection, bounded by both count
+        and total byte size. Replaces blind even-temporal spreading for
+        evaluation: see select_keyframes(..., outcomes=...) and
+        _bound_images_by_bytes.
+        """
+        outcomes = exercise.get_all_outcomes()
+        selected_frames = select_keyframes(events, frame_budget, outcomes=outcomes)
+        images, kept_frames = _encode_frames(selected_frames, session_id)
+        images, kept_frames = _bound_images_by_bytes(images, kept_frames, EVALUATION_MAX_IMAGE_BYTES)
+        return images, kept_frames
+
+    async def _call_ollama(
+        self, system_prompt: str, prompt: str, images: List[str], model: str,
+        context_size: int, timeout: float, use_vision: bool,
+    ) -> LLMEvaluationInsights:
+        if use_vision:
+            return await self.ollama.evaluate(
+                system_prompt, prompt, images=images, model=model,
+                num_ctx=context_size, timeout=timeout,
+            )
+        return await self.ollama.evaluate(
+            system_prompt, prompt, num_ctx=context_size, timeout=timeout,
         )
 
     async def _get_llm_insights(
@@ -372,17 +504,33 @@ class EvaluatorService:
         manifest: Optional[ManifestWriter] = None,
         baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
         evidence_facts: Optional[List[EvidenceFact]] = None,
-    ) -> LLMEvaluationInsights:
+    ) -> "tuple[LLMEvaluationInsights, Optional[str]]":
+        """Returns (insights, ai_unavailable_reason). ai_unavailable_reason is
+        None on success (including a successful retry); otherwise it names
+        why the LLM call could not be completed even after one retry with a
+        smaller evidence packet -- callers must score affected outcomes as
+        unavailable/unscored, never as a silent 0 that reads like the learner
+        didn't do the work (see _score_from_judgment).
+        """
         settings = get_settings()
         routing = _select_model(exercise, events, settings)
         use_vision, model, reason = routing.use_vision, routing.model, routing.reason
+
+        outcomes = exercise.get_all_outcomes()
+        # Budget ~EVALUATION_FRAMES_PER_OUTCOME frames per outcome, capped at
+        # EVALUATION_MAX_VISION_FRAMES -- a 3-outcome exercise budgets 6
+        # frames, not the full ceiling; a much larger exercise is still
+        # capped. Nothing here is specific to any one exercise or vocabulary.
+        frame_budget = min(
+            EVALUATION_MAX_VISION_FRAMES,
+            max(1, len(outcomes)) * EVALUATION_FRAMES_PER_OUTCOME,
+        ) if outcomes else EVALUATION_MAX_VISION_FRAMES
 
         images: List[str] = []
         frame_captions: Optional[str] = None
         selected_frames: List[SelectedFrame] = []
         if use_vision:
-            selected_frames = select_keyframes(events, EVALUATION_MAX_VISION_FRAMES)
-            images = _encode_images([sf.path for sf in selected_frames], session_id)
+            images, selected_frames = self._select_evaluation_frames(exercise, events, session_id, frame_budget)
             if not images:
                 use_vision, model = False, settings.ollama_model
                 reason = "screenshots could not be read; falling back to text-only"
@@ -398,16 +546,16 @@ class EvaluatorService:
         # the same room; the setting is evaluation-scoped, not vision-scoped.
         eval_timeout = settings.evaluation_timeout_seconds
 
-        def render(count: int):
+        def render(count: int, img_count: int, captions: Optional[str]):
             prompt, per_event_truncated = build_evaluation_user_prompt(
                 exercise, events, verification, evidence_error,
-                has_images=use_vision, frame_captions=frame_captions, max_events=count,
+                has_images=use_vision, frame_captions=captions, max_events=count,
                 baseline_verification=baseline_verification, evidence_facts=evidence_facts,
             )
             return EVALUATION_SYSTEM_PROMPT, prompt, per_event_truncated
 
         system_prompt, prompt, selected_count, estimated_tokens, truncated = fit_to_budget(
-            render, EVALUATION_MAX_EVENTS, context_size,
+            lambda c: render(c, len(images), frame_captions), EVALUATION_MAX_EVENTS, context_size,
             image_count=len(images) if use_vision else 0, min_count=EVALUATION_MIN_EVENTS,
         )
 
@@ -433,65 +581,96 @@ class EvaluatorService:
             str(truncated).lower(),
         )
 
-        # Record evaluation evidence snapshot in manifest before calling the model.
-        model_request_timestamp = datetime.now(timezone.utc).isoformat()
-        if manifest is not None:
-            available_frames = [
-                {
-                    "path": e.frame_path,
-                    "timestamp": e.timestamp.isoformat(),
-                    "application": e.application,
-                }
-                for e in events
-                if e.frame_path
-            ]
+        available_frames = [
+            {
+                "path": e.frame_path,
+                "timestamp": e.timestamp.isoformat(),
+                "application": e.application,
+            }
+            for e in events
+            if e.frame_path
+        ]
+
+        def _record_manifest(frames: List[SelectedFrame], sys_p: str, user_p: str,
+                              retry_used: bool, ai_unavailable: Optional[str]) -> None:
+            if manifest is None:
+                return
             try:
                 manifest.record_final_evaluation(
-                    model_request_timestamp=model_request_timestamp,
+                    model_request_timestamp=datetime.now(timezone.utc).isoformat(),
                     model=model,
                     routing_reason=reason,
                     event_count=len(events),
                     normalized_event_count=len(events),
                     available_frames=available_frames,
-                    selected_frames=selected_frames,
+                    selected_frames=frames,
                     images_attached=bool(images),
                     use_vision=use_vision,
+                    retry_used=retry_used,
+                    ai_unavailable=ai_unavailable,
                 )
                 if use_vision:
                     manifest.save_diagnostic_payload(
-                        consumer="final_evaluation",
-                        system_prompt=system_prompt,
-                        user_prompt=prompt,
-                        selected_frames=selected_frames,
+                        consumer="final_evaluation_retry" if retry_used else "final_evaluation",
+                        system_prompt=sys_p,
+                        user_prompt=user_p,
+                        selected_frames=frames,
                     )
             except Exception as exc:  # noqa: BLE001 -- manifest errors must never fail evaluation
                 logger.warning("Evaluation manifest write failed: %s", exc)
 
         try:
-            if use_vision:
-                insights = await self.ollama.evaluate(
-                    system_prompt, prompt, images=images, model=model,
-                    num_ctx=context_size, timeout=eval_timeout,
-                )
-            else:
-                insights = await self.ollama.evaluate(
-                    system_prompt, prompt, num_ctx=context_size, timeout=eval_timeout,
-                )
+            insights = await self._call_ollama(system_prompt, prompt, images, model, context_size, eval_timeout, use_vision)
+            _record_manifest(selected_frames, system_prompt, prompt, retry_used=False, ai_unavailable=None)
         except OllamaError as exc:
-            logger.warning("LLM evaluation unavailable: %s", exc)
-            if events:
-                # Capture worked -- only the AI evaluation call failed. Must not
-                # be worded as if activity capture itself was unavailable.
-                summary = (
-                    f"Activity was captured successfully, but AI evaluation failed ({exc}). "
-                    "Scoring below relies on deterministic verification and observed evidence only."
+            logger.warning(
+                "Initial evaluation call failed (%s); retrying once with a smaller, "
+                "still-relevant evidence packet instead of repeating the same request", exc,
+            )
+            retry_images, retry_frames, retry_captions = images, selected_frames, frame_captions
+            if use_vision and len(selected_frames) > 1:
+                retry_frame_count = max(1, len(selected_frames) // EVALUATION_RETRY_FRAME_DIVISOR)
+                # Keep the MOST relevant frames (highest relevance_score),
+                # never an arbitrary temporal subset -- a timeout must not
+                # be "fixed" by discarding the evidence that mattered.
+                ranked = sorted(selected_frames, key=lambda sf: sf.relevance_score, reverse=True)
+                keep_paths = {sf.path for sf in ranked[:retry_frame_count]}
+                retry_frames = [sf for sf in selected_frames if sf.path in keep_paths]
+                retry_images, retry_frames = _encode_frames(retry_frames, session_id)
+                retry_captions = format_frame_captions(retry_frames) if retry_frames else None
+            retry_event_ceiling = max(EVALUATION_MIN_EVENTS, selected_count // EVALUATION_RETRY_EVENT_DIVISOR)
+
+            retry_system_prompt, retry_prompt, retry_count, retry_tokens, retry_truncated = fit_to_budget(
+                lambda c: render(c, len(retry_images), retry_captions), retry_event_ceiling, context_size,
+                image_count=len(retry_images) if use_vision else 0, min_count=EVALUATION_MIN_EVENTS,
+            )
+            logger.info(
+                "Evaluation retry payload: screenshots=%d (was %d), events<=%d (was %d), estimated_tokens=%d",
+                len(retry_images), len(images), retry_count, selected_count, retry_tokens,
+            )
+
+            try:
+                insights = await self._call_ollama(
+                    retry_system_prompt, retry_prompt, retry_images, model, context_size, eval_timeout, use_vision,
                 )
-            else:
-                summary = (
-                    f"AI-based process analysis was unavailable ({exc}), and no activity evidence "
-                    "was captured either. Scoring below relies on deterministic verification only."
-                )
-            return LLMEvaluationInsights(summary=summary)
+                images, selected_frames, frame_captions = retry_images, retry_frames, retry_captions
+                _record_manifest(retry_frames, retry_system_prompt, retry_prompt, retry_used=True, ai_unavailable=None)
+            except OllamaError as exc2:
+                logger.warning("Retry evaluation call also failed (%s); marking evaluation unavailable", exc2)
+                _record_manifest(retry_frames, retry_system_prompt, retry_prompt, retry_used=True, ai_unavailable=str(exc2))
+                if events:
+                    # Capture worked -- only the AI evaluation call failed. Must not
+                    # be worded as if activity capture itself was unavailable.
+                    summary = (
+                        f"Activity was captured successfully, but AI evaluation failed ({exc2}). "
+                        "Scoring below relies on deterministic verification and observed evidence only."
+                    )
+                else:
+                    summary = (
+                        f"AI-based process analysis was unavailable ({exc2}), and no activity evidence "
+                        "was captured either. Scoring below relies on deterministic verification only."
+                    )
+                return LLMEvaluationInsights(summary=summary), str(exc2)
 
         # Vision models (e.g. llava) frequently return a coherent summary but
         # omit the structured outcome_judgments array, or fill it only partially.
@@ -516,7 +695,7 @@ class EvaluatorService:
                     model=model, num_ctx=context_size, timeout=eval_timeout,
                 )
 
-        return insights
+        return insights, None
 
     async def _fill_missing_judgments(
         self,
@@ -592,11 +771,12 @@ class EvaluatorService:
         evidence_error: Optional[str] = None,
         baseline_verification: Optional[Dict[str, VerificationDetail]] = None,
         evidence_facts: Optional[List[EvidenceFact]] = None,
+        ai_unavailable_reason: Optional[str] = None,
     ) -> OutcomeResult:
         if outcome.type == OutcomeType.filesystem and outcome.id in verification:
             return self._score_filesystem_outcome(
                 outcome, verification, baseline_verification, events, llm_insights, evidence_error,
-                evidence_facts,
+                evidence_facts, ai_unavailable_reason=ai_unavailable_reason,
             )
 
         # observed_behavior AND process outcomes (and any filesystem outcome
@@ -604,7 +784,10 @@ class EvaluatorService:
         # per-outcome LLM judgment -- there is no app-specific ground truth to
         # fall back on, so this is the only mechanism available for anything
         # that isn't a declared filesystem check.
-        return self._score_from_judgment(outcome, events, llm_insights, evidence_error, evidence_facts)
+        return self._score_from_judgment(
+            outcome, events, llm_insights, evidence_error, evidence_facts,
+            ai_unavailable_reason=ai_unavailable_reason,
+        )
 
     def _score_filesystem_outcome(
         self,
@@ -615,6 +798,7 @@ class EvaluatorService:
         llm_insights: LLMEvaluationInsights,
         evidence_error: Optional[str] = None,
         evidence_facts: Optional[List[EvidenceFact]] = None,
+        ai_unavailable_reason: Optional[str] = None,
     ) -> OutcomeResult:
         """Deterministic verification proves a final state exists; it says
         nothing about whether THIS session produced it. Distinguish the two
@@ -668,7 +852,10 @@ class EvaluatorService:
 
         # The compliant state already existed before this session began --
         # only current-session evidence of the action can still earn credit.
-        result = self._score_from_judgment(outcome, events, llm_insights, evidence_error, evidence_facts)
+        result = self._score_from_judgment(
+            outcome, events, llm_insights, evidence_error, evidence_facts,
+            ai_unavailable_reason=ai_unavailable_reason,
+        )
         result.final_state_verified = True
 
         fact = self._matching_action_fact(outcome.id, evidence_facts)
@@ -712,6 +899,61 @@ class EvaluatorService:
         result.demonstrated_this_session = result.passed
         return result
 
+    @staticmethod
+    def _criteria_fully_satisfied(outcome: ExpectedOutcome, judgment: OutcomeJudgment) -> bool:
+        """An ENRICHED outcome (explicit success_criteria authored in the
+        YAML) earns full credit only when the judgment's own criteria
+        assessment mechanically supports it -- observed=true alone is never
+        sufficient (that was the bug: a loosely-justified observed=true
+        converted straight into full points regardless of how many of the
+        outcome's own success criteria the judgment actually addressed).
+
+        Requires ALL THREE, independent of what the LLM set verification_state
+        to on its own -- a model that mislabels a partial result as "verified"
+        is not trusted just because it said so:
+        - the judgment's own state is exactly "verified" (per
+          EVALUATION_SYSTEM_PROMPT's own definition: "Do NOT use verified if
+          any required criterion is unsatisfied");
+        - zero criteria were placed in criteria_not_met;
+        - every one of the outcome's authored success_criteria was addressed
+          (present in criteria_met or criteria_not_met) -- a judgment that
+          silently only discusses 1 of 3 required criteria fails closed
+          rather than being read as "the other two must be fine".
+
+        Legacy outcomes (no explicit success_criteria -- has_explicit_criteria
+        is False) never reach this method; see the has_explicit_criteria
+        guard at the call site, which preserves the original observed=true
+        behavior for them exactly.
+        """
+        if judgment.verification_state != VerificationState.verified:
+            return False
+        if judgment.criteria_not_met:
+            return False
+        required = len(outcome.success_criteria)
+        addressed = len(judgment.criteria_met) + len(judgment.criteria_not_met)
+        return addressed >= required
+
+    @staticmethod
+    def _incomplete_criteria_evidence(outcome: ExpectedOutcome, judgment: OutcomeJudgment) -> str:
+        """Student/instructor-facing explanation for why an outcome the model
+        marked observed=true still did not earn full credit -- must name the
+        actual gap (which criteria are unmet, or how many were never
+        addressed) so feedback never contradicts the score by looking like a
+        generic failure when real partial progress was found."""
+        parts: List[str] = [judgment.evidence] if judgment.evidence else []
+        if judgment.criteria_not_met:
+            parts.append("Unmet success criteria: " + "; ".join(judgment.criteria_not_met))
+        required = len(outcome.success_criteria)
+        addressed = len(judgment.criteria_met) + len(judgment.criteria_not_met)
+        missing = max(0, required - addressed)
+        if missing:
+            parts.append(
+                f"{missing} of {required} required success criteria were not addressed by the judgment."
+            )
+        if not parts:
+            parts.append("Not all required success criteria were supported by the available evidence.")
+        return " ".join(parts)
+
     def _score_from_judgment(
         self,
         outcome: ExpectedOutcome,
@@ -719,6 +961,7 @@ class EvaluatorService:
         llm_insights: LLMEvaluationInsights,
         evidence_error: Optional[str] = None,
         evidence_facts: Optional[List[EvidenceFact]] = None,
+        ai_unavailable_reason: Optional[str] = None,
     ) -> OutcomeResult:
         if evidence_error:
             return OutcomeResult(
@@ -759,31 +1002,72 @@ class EvaluatorService:
         if judgment is not None and judgment.observed:
             # Screenshots are the primary source of truth for visual exercises
             # (see _select_model): when the vision model directly observes an
-            # action on screen, that is direct evidence -- not inference -- so it
-            # earns full credit, the same as a deterministic filesystem check.
-            # The strict evidence rules in EVALUATION_SYSTEM_PROMPT guard against
-            # false positives; if those prove too loose in practice, tighten the
-            # prompt rather than re-capping real observations at half credit.
+            # action on screen, that is direct evidence -- not inference. But
+            # for an ENRICHED outcome (explicit success_criteria authored),
+            # observed=true by itself is not sufficient for FULL credit --
+            # see _criteria_fully_satisfied. Legacy outcomes (no explicit
+            # criteria -- nothing more granular was ever authored to check)
+            # keep the original behavior unchanged: observed=true earns full
+            # credit outright.
+            if not outcome.has_explicit_criteria or self._criteria_fully_satisfied(outcome, judgment):
+                return OutcomeResult(
+                    id=outcome.id,
+                    passed=True,
+                    score=outcome.weight,
+                    max_score=outcome.weight,
+                    confidence=Confidence.strongly_observed,
+                    evidence=judgment.evidence or "Observed in captured screenshots/activity.",
+                    verification_state=judgment.verification_state,
+                    feedback=judgment.feedback,
+                )
+            # The model claims the behavior was observed, but its own
+            # criteria assessment does not support full credit (some
+            # required criteria unmet, or not all were addressed). The YAML
+            # defines no numeric partial-credit scale for this outcome, so
+            # this fails closed at 0 rather than inventing a fraction --
+            # partial criteria coverage must never silently become full
+            # credit, and a missing criterion judgment must fail closed.
             return OutcomeResult(
                 id=outcome.id,
-                passed=True,
-                score=outcome.weight,
+                passed=False,
+                score=0.0,
                 max_score=outcome.weight,
-                confidence=Confidence.strongly_observed,
-                evidence=judgment.evidence or "Observed in captured screenshots/activity.",
+                confidence=Confidence.unknown,
+                evidence=self._incomplete_criteria_evidence(outcome, judgment),
                 verification_state=judgment.verification_state,
                 feedback=judgment.feedback,
             )
 
         if judgment is None:
-            evidence = (
-                "There was insufficient captured evidence to confidently evaluate this behavior."
-                if not events
-                else "The AI evaluator did not return a judgment for this outcome."
+            if ai_unavailable_reason:
+                # The LLM call itself failed (even after one retry with a
+                # smaller evidence packet) -- this is an EVALUATOR failure,
+                # not evidence the learner didn't do the work, and must read
+                # and score differently from "the model looked and found
+                # nothing" (the `else` branch below). See _get_llm_insights.
+                evidence = (
+                    f"AI evaluation could not be completed for this outcome ({ai_unavailable_reason}), "
+                    "even after retrying with a smaller evidence packet. This reflects an evaluator "
+                    "failure, not evidence that the learner did not complete this outcome."
+                )
+                verification_state = VerificationState.unverifiable
+            elif not events:
+                evidence = "There was insufficient captured evidence to confidently evaluate this behavior."
+                verification_state = None
+            else:
+                evidence = "The AI evaluator did not return a judgment for this outcome."
+                verification_state = None
+            return OutcomeResult(
+                id=outcome.id,
+                passed=False,
+                score=0.0,
+                max_score=outcome.weight,
+                confidence=Confidence.unknown,
+                evidence=evidence,
+                verification_state=verification_state,
             )
-        else:
-            evidence = judgment.evidence or "Not observed in captured activity."
 
+        evidence = judgment.evidence or "Not observed in captured activity."
         return OutcomeResult(
             id=outcome.id,
             passed=False,
@@ -791,8 +1075,8 @@ class EvaluatorService:
             max_score=outcome.weight,
             confidence=Confidence.unknown,
             evidence=evidence,
-            verification_state=judgment.verification_state if judgment else None,
-            feedback=judgment.feedback if judgment else None,
+            verification_state=judgment.verification_state,
+            feedback=judgment.feedback,
         )
 
     def _reconcile_narrative(
